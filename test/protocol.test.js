@@ -540,13 +540,32 @@ test("PingTurn(16字节) 在版本变化时返回节点列表", () => {
   assert.ok(ips.includes("10.26.0.3"), `节点列表应包含 B，实际: ${ips.join(",")}`);
 });
 
-test("错误：network_code 不在白名单时拒绝", () => {
+test("白名单：只放行唯一匹配的 network_code", () => {
   const env = { VNT_NETWORK_WHITELIST: "allowed-net" };
   const out = [];
-  const s = new Session(env);
-  const ok = s.handleFirstFrame(encodeRegRequestFixture({ networkCode: "other-net", deviceId: "A" }), (b) => out.push(b));
-  assert.equal(ok, false);
+
+  // 不匹配 -> 拒绝
+  const s1 = new Session(env);
+  assert.equal(s1.handleFirstFrame(encodeRegRequestFixture({ networkCode: "other-net", deviceId: "A" }), (b) => out.push(b)), false);
   assert.equal(out.length, 1);
+
+  // 完全一致 -> 放行
+  const s2 = new Session(env);
+  assert.equal(s2.handleFirstFrame(encodeRegRequestFixture({ networkCode: "allowed-net", deviceId: "B" }), () => {}), true);
+});
+
+test("白名单：不支持逗号分隔的多值（多值视为整体，一律拒绝）", () => {
+  const env = { VNT_NETWORK_WHITELIST: "net1,net2" };
+  const s1 = new Session(env);
+  assert.equal(s1.handleFirstFrame(encodeRegRequestFixture({ networkCode: "net1", deviceId: "A" }), () => {}), false);
+  const s2 = new Session(env);
+  assert.equal(s2.handleFirstFrame(encodeRegRequestFixture({ networkCode: "net2", deviceId: "B" }), () => {}), false);
+});
+
+test("白名单：留空表示不限制", () => {
+  const env = { VNT_NETWORK_WHITELIST: "   " };
+  const s = new Session(env);
+  assert.equal(s.handleFirstFrame(encodeRegRequestFixture({ networkCode: "any-net", deviceId: "A" }), () => {}), true);
 });
 
 test("错误：非 VNT 客户端类型被拒绝", () => {

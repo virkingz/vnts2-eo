@@ -112,7 +112,7 @@ node test/protocol.test.js   # 25 项协议/流程自测
 | `VNT_GATEWAY` | `10.26.0.1` | 虚拟网关地址 |
 | `VNT_NETMASK` | `255.255.255.0` | 虚拟子网掩码（决定地址池大小） |
 | `VNT_LEASE_SECONDS` | `604800` | 离线设备地址租期（秒），到期后才回收 |
-| `VNT_NETWORK_WHITELIST` | 空 | 允许接入的 `network_code`，逗号分隔；留空不限制 |
+| `VNT_NETWORK_WHITELIST` | 空 | **只能填一个** `network_code`。留空表示不限制；填入后必须完全一致才允许接入 |
 
 ---
 

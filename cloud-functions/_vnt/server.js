@@ -74,16 +74,15 @@ export class Session {
     this.createdAt = Date.now();
   }
 
-  /** 白名单校验：VNT_NETWORK_WHITELIST 为空表示不限制 */
+  /**
+   * 白名单校验：VNT_NETWORK_WHITELIST 只能填一个 network_code。
+   * 留空表示不限制；填入后必须完全一致才允许接入。
+   * 不做逗号拆分——多值会被当作一个整体字符串，从而永远匹配不上。
+   */
   checkNetworkAllowed(code) {
-    const raw = (this.env.VNT_NETWORK_WHITELIST || "").trim();
-    if (!raw) return true;
-    const allowed = raw
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
-    if (allowed.length === 0) return true;
-    return allowed.includes(code);
+    const allowed = (this.env.VNT_NETWORK_WHITELIST || "").trim();
+    if (!allowed) return true;
+    return allowed === code;
   }
 
   /** 处理首帧注册请求（同步：解码 + 分配 + 回响应，无需 await） */
