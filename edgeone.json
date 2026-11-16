@@ -1,0 +1,14 @@
+{
+  "name": "vnts2-edgeone",
+  "cloudFunctions": {
+    "nodejs": {
+      "maxDuration": 120
+    }
+  },
+  "headers": [
+    {
+      "source": "/health",
+      "headers": [{ "key": "cache-control", "value": "no-store" }]
+    }
+  ]
+}

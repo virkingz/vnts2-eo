@@ -1,0 +1,22 @@
+{
+  "name": "vnts2-edgeone",
+  "version": "1.0.0",
+  "private": true,
+  "description": "VNT 2.x 服务端（vnts2）的 EdgeOne Cloud Functions 实现：WebSocket 中继 + P2P 打洞信令",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "edgeone pages dev",
+    "test": "node test/protocol.test.js && node test/ws-e2e.test.mjs"
+  },
+  "keywords": [
+    "vnt",
+    "vnts2",
+    "edgeone",
+    "websocket",
+    "overlay-network"
+  ],
+  "license": "MIT"
+}
