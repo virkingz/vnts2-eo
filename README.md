@@ -72,8 +72,27 @@ P2P 直连才是主路径，服务端中继只是打不通时的兜底。
 
 ### 1. 部署
 
-推到 GitHub 后在 [EdgeOne Makers 控制台](https://console.cloud.tencent.com/edgeone/pages) 关联仓库即可。
-构建命令与输出目录**都留空**（本项目没有静态产物）。
+推到 GitHub 后在 [EdgeOne Makers 控制台](https://console.cloud.tencent.com/edgeone/pages)
+新建项目并关联仓库 `virkingz/vnts2-eo`。
+
+**「构建部署配置」四栏这样填：**
+
+| 字段 | 填什么 | 为什么 |
+|---|---|---|
+| 框架预设 | `Other` | 不是前端框架项目 |
+| 根目录 | `/`（保持默认） | 仓库根就是项目根 |
+| 输出目录 | **留空** | 本项目没有静态产物，函数直接部署 |
+| 编译命令 | **留空** | 无需构建 |
+| 安装命令 | `npm install` | **必须填**，见下方说明 |
+
+`edgeone.json` 里已经把 `installCommand` / `nodeVersion` / `maxDuration` 写死了，
+所以在控制台留空也会以文件为准。但**安装命令建议在界面上也填上**，双重保险。
+
+> ⚠️ **为什么安装命令必须执行**：本项目依赖 `@edgeone/pages-blob`。
+> 如果不装，代码会**静默降级到内存后端** —— 服务看起来完全正常，
+> 但设备表无法跨实例共享（表现为设备互相看不见）。
+> 部署后请访问 `/health` 确认 `"storage": "blob"`；若显示 `memory`，
+> 说明依赖没装上，`storageHint` 字段会给出提示。
 
 > ⚠️ **根目录不能放 `index.html`。** EdgeOne 的路由规则是「静态资源优先于函数」，
 > 放了就会把 `/` 的 WebSocket 升级请求一起吃掉。本仓库根目录刻意不放任何 HTML。
@@ -202,7 +221,12 @@ return { websocket: { onopen, onmessage, onclose, onerror } };
 默认测试域名（`*.edgeone.app`）走**海外节点**。要在中国大陆有低延迟，
 必须绑定**已备案**的自定义域名并选择中国大陆加速区域。
 
-### 10. 消息类型编号不要杜撰
+### 10. 部署后设备互相看不见
+存储降级为内存后端了 —— 十有八九是构建时没执行 `npm install`，
+`@edgeone/pages-blob` 没装上。**这种情况下服务不会报错**，只是跨实例共享失效。
+访问 `/health` 看 `storage` 字段：`blob` 才对，`memory` 就是降级了。
+
+### 11. 消息类型编号不要杜撰
 VNT 2.x 的 `MsgType` 里，**33 号是未分配的**（客户端 `try_from(33u8)` 会报错）。
 早期版本这里写了 `Application: 33`，属杜撰 —— 多发一个非法类型比少一个更危险。
 

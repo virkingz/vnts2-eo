@@ -22,6 +22,7 @@ import { Session } from "./_vnt/server.js";
 import { registry, resolveConfig } from "./_vnt/state.js";
 import { decodeRequestMessage } from "./_vnt/control-messages.js";
 import { handleAdmin } from "./_vnt/admin.js";
+import { getBackend } from "./_vnt/shared-store.js";
 
 /** 把一帧数据统一成 Uint8Array */
 function normalize(message) {
@@ -216,20 +217,35 @@ export const onRequest = async (context) => {
     const net = cfg.networkCode ? registry.find(cfg.networkCode) : null;
     const nets = [];
     for (const n of registry.networks.values()) nets.push(n.toJSON());
-    return Response.json({
-      ok: true,
-      service: "vnts2-edgeone",
-      protocol: "vnt2",
-      mode: "p2p-punch-only",
-      wsMode: typeof WebSocketPair !== "undefined" ? "websocket-pair" : "callback-object",
-      network: cfg.networkCode || null,
-      registeredDevices: net ? net.shared.size : 0,
-      onlineDevices: net ? net.count().online : 0,
-      connectionsTotal: registry.stats.connectionsTotal,
-      bytesSignaled: registry.stats.bytesSignaled,
-      uptimeSeconds: Math.floor((Date.now() - registry.startedAt) / 1000),
-      detail: nets,
-    });
+    const backend = await getBackend();
+    const storageOk = backend.kind === "blob";
+    return Response.json(
+      {
+        ok: true,
+        service: "vnts2-edgeone",
+        protocol: "vnt2",
+        mode: "p2p-punch-only",
+        wsMode: typeof WebSocketPair !== "undefined" ? "websocket-pair" : "callback-object",
+        // storage=blob 才是期望值；memory 说明 Blob SDK 没装上，
+        // 此时服务仍能工作，但**跨实例共享失效**（设备互相看不见）。
+        storage: backend.kind,
+        storageOk,
+        ...(storageOk
+          ? {}
+          : {
+              storageHint:
+                "存储降级为内存，跨实例共享失效。请确认 package.json 里有 @edgeone/pages-blob 依赖，且构建时执行了 npm install。",
+            }),
+        network: cfg.networkCode || null,
+        registeredDevices: net ? net.shared.size : 0,
+        onlineDevices: net ? net.count().online : 0,
+        connectionsTotal: registry.stats.connectionsTotal,
+        bytesSignaled: registry.stats.bytesSignaled,
+        uptimeSeconds: Math.floor((Date.now() - registry.startedAt) / 1000),
+        detail: nets,
+      },
+      { headers: { "cache-control": "no-store" } },
+    );
   }
 
   return new Response(statusHtml(env), {
