@@ -29,6 +29,7 @@
 import { registry, resolveConfig } from "./state.js";
 import { handleAdmin } from "./admin.js";
 import { getBackend } from "./shared-store.js";
+import { probeWebSocket } from "./ws.js";
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -46,6 +47,18 @@ export async function handleHttp(request, env) {
   const url = new URL(request.url);
   if (url.pathname === "/health" || url.pathname === "/healthz") {
     return healthResponse(env);
+  }
+
+  // 诊断端点：探测当前运行时对 WebSocket 的支持情况。
+  // 不含任何敏感信息，可安全公开（就是几个 typeof 结果）。
+  if (url.pathname === "/health/ws") {
+    return Response.json(
+      {
+        runtime: typeof process !== "undefined" ? process.version : "(no process)",
+        probe: probeWebSocket(),
+      },
+      { headers: { "cache-control": "no-store" } },
+    );
   }
 
   return new Response(statusHtml(), {
