@@ -213,31 +213,36 @@ function fakePair() {
   }
 }
 
-// ── 有 WebSocketPair 时：优先用它，返回 Response ──
+// ── 即使运行时*提供* WebSocketPair，也绝不能使用它 ──
+// 本项目的运行时不保证有 WebSocketPair，一旦调用 new WebSocketPair() 就抛
+// ReferenceError → 502。所以必须恒定返回回调对象，与是否存在该全局无关。
 {
   const saved = globalThis.WebSocketPair;
-  const sockets = fakePair();
+  let constructed = 0;
+  globalThis.WebSocketPair = class {
+    constructor() {
+      constructed++;
+      throw new Error("绝不能调用 new WebSocketPair()");
+    }
+  };
   try {
     const res = await rootHandler({
       request: new Request("https://x/", { headers: { upgrade: "websocket" } }),
       env: ENV,
     });
-    check("有 WebSocketPair 时返回 Response（优先级更高）", res instanceof Response, String(res));
-    check("WebSocketPair 形态返回前已建好 socket", sockets.length === 1);
-
-    // 通过 socket 发一帧，验证事件绑定生效
-    const socket = sockets[0];
-    const reg = new Request("https://x/", { headers: { upgrade: "websocket" } });
-    void reg;
-    const msgListeners = socket.listeners.get("message") || [];
-    check("WebSocketPair 形态下已绑定 message 事件", msgListeners.length > 0, String(msgListeners.length));
+    check(
+      "存在 WebSocketPair 时仍返回回调对象（不用它）",
+      !!res?.websocket && typeof res.websocket.onmessage === "function",
+      Object.keys(res || {}).join(","),
+    );
+    check("完全没有构造 WebSocketPair（那是 502 的来源）", constructed === 0, `构造了 ${constructed} 次`);
   } finally {
     if (saved === undefined) delete globalThis.WebSocketPair;
     else globalThis.WebSocketPair = saved;
   }
 }
 
-// ── WebSocketPair 抛错时必须回落，不能让平台报 502 ──
+// ── WebSocketPair 抛错也必须能正常工作（我们根本不碰它）──
 {
   const saved = globalThis.WebSocketPair;
   globalThis.WebSocketPair = class {
@@ -279,3 +284,10 @@ function fakePair() {
     if (saved !== undefined) globalThis.WebSocketPair = saved;
   }
 }
+
+console.log("");
+if (failed > 0) {
+  console.log(`失败 ${failed} 项，通过 ${passed} 项`);
+  process.exit(1);
+}
+console.log(`路由测试全部通过（${passed} 项）`);
