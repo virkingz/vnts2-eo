@@ -5,7 +5,7 @@
 //
 // 运行：node tools/probe-ws.mjs <wss地址> <network_code> <device_id> <ip>
 
-import { Writer } from "../cloud-functions/_vnt/protobuf.js";
+import { Writer } from "../node-functions/_vnt/protobuf.js";
 
 const [, , urlArg, netArg, devArg, ipArg] = process.argv;
 const url = urlArg || "wss://eovnts2.virking.top:443";

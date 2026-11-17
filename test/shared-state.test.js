@@ -13,14 +13,14 @@
 
 import assert from "node:assert/strict";
 
-import { ipToU32, u32ToIp, buildPacket, MsgType, parseHeaderFast, HEAD_LENGTH } from "../cloud-functions/_vnt/packet.js";
+import { ipToU32, u32ToIp, buildPacket, MsgType, parseHeaderFast, HEAD_LENGTH } from "../node-functions/_vnt/packet.js";
 import {
   createMemoryBackend,
   resetBackend,
   signalPrefixFor,
-} from "../cloud-functions/_vnt/shared-store.js";
-import { Registry, resolveConfig } from "../cloud-functions/_vnt/state.js";
-import { Session } from "../cloud-functions/_vnt/server.js";
+} from "../node-functions/_vnt/shared-store.js";
+import { Registry, resolveConfig } from "../node-functions/_vnt/state.js";
+import { Session } from "../node-functions/_vnt/server.js";
 
 /** 本测试统一用 10.26.2.0/24，与项目推荐网段一致 */
 const GATEWAY = "10.26.2.1";
@@ -229,7 +229,7 @@ test("过期信令被丢弃且清理", async () => {
   const backend = globalThis.__VNT_SHARED_BACKEND__;
 
   // 手工塞一条 60 秒前的信令
-  const { signalKey } = await import("../cloud-functions/_vnt/shared-store.js");
+  const { signalKey } = await import("../node-functions/_vnt/shared-store.js");
   await backend.put(
     signalKey(code, ipToU32("10.26.2.3"), "old"),
     JSON.stringify({ dest: ipToU32("10.26.2.3"), at: Date.now() - 60_000, data: [1, 2, 3] }),
@@ -261,7 +261,7 @@ test("Session 心跳会取走别处投来的信令", async () => {
   const sb = new Session({ VNT_NETWORK: code, VNT_GATEWAY: GATEWAY });
   const payloadLen = outB.length;
   void payloadLen;
-  const { Writer } = await import("../cloud-functions/_vnt/protobuf.js");
+  const { Writer } = await import("../node-functions/_vnt/protobuf.js");
   const reg = new Writer();
   reg.writeString(1, code);
   reg.writeString(2, "B");

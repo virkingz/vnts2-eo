@@ -1,11 +1,11 @@
 // HTTP 路由分发（与 WebSocket 接入层分开）
 //
 // 为什么要单独一个文件：EdgeOne 是**文件即路由**——
-//   cloud-functions/index.js  → 只映射到 /
-//   cloud-functions/x.js      → 只映射到 /x
+//   node-functions/index.js  → 只映射到 /
+//   node-functions/x.js      → 只映射到 /x
 // 所以 /health、/admin/* 这些路径**不会**被 index.js 处理。
 // 本项目把这些非 WS 的路由集中在这里，由 catch-all 入口
-// （cloud-functions/[[default]].js）与 index.js 共用同一份逻辑，
+// （node-functions/[[default]].js）与 index.js 共用同一份逻辑，
 // 避免两处各写一遍而长歪。
 //
 // ═══════════════════════════════════════════════════════════════════════════
@@ -35,7 +35,7 @@ import { probeWebSocket } from "./ws.js";
  * 构建标记。每次改动部署时手动更新，用于从 /health 判断部署是否生效。
  * 换成一个单调递增的时间戳字符串。
  */
-const BUILD_REV = "1.0.2-nf";
+const BUILD_REV = "2.0.0-nodefn";
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));

@@ -7,16 +7,16 @@
 //
 // 运行：node test/ws-e2e.test.mjs
 
-import { resetBackend, createMemoryBackend } from "../cloud-functions/_vnt/shared-store.js";
+import { resetBackend, createMemoryBackend } from "../node-functions/_vnt/shared-store.js";
 
 // 必须在 import index.js 之前装好共享后端
 globalThis.__VNT_SHARED_BACKEND__ = createMemoryBackend();
 resetBackend();
 
-const { onRequest } = await import("../cloud-functions/index.js");
-const { Writer } = await import("../cloud-functions/_vnt/protobuf.js");
+const { onRequest } = await import("../node-functions/index.js");
+const { Writer } = await import("../node-functions/_vnt/protobuf.js");
 const { ipToU32, u32ToIp, buildPacket, MsgType, HEAD_LENGTH } = await import(
-  "../cloud-functions/_vnt/packet.js"
+  "../node-functions/_vnt/packet.js"
 );
 
 const NET = "e2e-net";

@@ -4,7 +4,7 @@
 
 import assert from "node:assert/strict";
 
-import { Reader, Writer, decodePacked } from "../cloud-functions/_vnt/protobuf.js";
+import { Reader, Writer, decodePacked } from "../node-functions/_vnt/protobuf.js";
 import {
   NetPacket,
   MsgType,
@@ -16,7 +16,7 @@ import {
   maskToPrefixLen,
   prefixLenToMask,
   decrTtlInPlace,
-} from "../cloud-functions/_vnt/packet.js";
+} from "../node-functions/_vnt/packet.js";
 import {
   decodeRequestMessage,
   encodeRegResponse,
@@ -26,9 +26,9 @@ import {
   decodeRpcRequest,
   encodeRpcResponse,
   ClientType,
-} from "../cloud-functions/_vnt/control-messages.js";
-import { registry, resolveConfig } from "../cloud-functions/_vnt/state.js";
-import { Session } from "../cloud-functions/_vnt/server.js";
+} from "../node-functions/_vnt/control-messages.js";
+import { registry, resolveConfig } from "../node-functions/_vnt/state.js";
+import { Session } from "../node-functions/_vnt/server.js";
 
 let passed = 0;
 let failed = 0;

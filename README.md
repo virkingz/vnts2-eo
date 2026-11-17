@@ -222,9 +222,9 @@ return { websocket: { onopen, onmessage, onclose, onerror } };
 必须绑定**已备案**的自定义域名并选择中国大陆加速区域。
 
 ### 10. `/health` 或 `/admin` 返回 404
-EdgeOne 是**文件即路由**：`cloud-functions/index.js` **只映射到 `/`**，
+EdgeOne 是**文件即路由**：`node-functions/index.js` **只映射到 `/`**，
 不会处理 `/health`、`/admin/*` —— 这些路径会去找不存在的同名文件然后掉进静态 404。
-必须有一个 catch-all 入口 `cloud-functions/[[default]].js` 兜底。
+必须有一个 catch-all 入口 `node-functions/[[default]].js` 兜底。
 本仓库两个入口共用 `_vnt/http.js` 与 `_vnt/ws.js` 的同一份实现。
 
 ### 11. 部署后设备互相看不见
@@ -257,7 +257,7 @@ VNT 2.x 的 `MsgType` 里，**33 号是未分配的**（客户端 `try_from(33u8
 
 ```
 vnts2-edgeone/
-├── cloud-functions/              # EdgeOne 函数目录（目录前缀不进 URL）
+├── node-functions/              # EdgeOne 函数目录（目录前缀不进 URL）
 │   ├── index.js                  # 根路径入口（文件即路由 → 只映射 /）
 │   ├── [[default]].js            # catch-all 入口 → /health、/admin/* 等
 │   └── _vnt/                     # 下划线开头 = 内部模块，不生成路由

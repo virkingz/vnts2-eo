@@ -1,18 +1,18 @@
 // 路由分发验证：确认两个入口各自负责哪些路径
 //
 // EdgeOne 的优先级：静态路由 > [param] > [[catch-all]]
-//   "/"        → cloud-functions/index.js
-//   "/health"  → cloud-functions/[[default]].js（因为不存在 health.js）
+//   "/"        → node-functions/index.js
+//   "/health"  → node-functions/[[default]].js（因为不存在 health.js）
 //
 // 运行：node test/routes.test.mjs
 
-import { createMemoryBackend, resetBackend } from "../cloud-functions/_vnt/shared-store.js";
+import { createMemoryBackend, resetBackend } from "../node-functions/_vnt/shared-store.js";
 
 globalThis.__VNT_SHARED_BACKEND__ = createMemoryBackend();
 resetBackend();
 
-const { onRequest: rootHandler } = await import("../cloud-functions/index.js");
-const { onRequest: catchAllHandler } = await import("../cloud-functions/[[default]].js");
+const { onRequest: rootHandler } = await import("../node-functions/index.js");
+const { onRequest: catchAllHandler } = await import("../node-functions/[[default]].js");
 
 const ENV = { VNT_NETWORK: "routes-net", VNT_GATEWAY: "10.26.2.1", VNT_ADMIN_TOKEN: "tok" };
 
