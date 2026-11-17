@@ -1,23 +1,44 @@
-// 通过 index.js 的 onRequest 走完整 WebSocket 链路，验证接入层串联。
+// 接入层端到端测试：走 index.js 的 onRequest，覆盖
+//   * WebSocket 升级（WebSocketPair 与回调对象两种形态）
+//   * /admin 设备登记 API
+//   * /health
+//   * 客户端注册（含登记校验）
+//   * 打洞信令转发、业务流量不中转
 //
-// 顺带覆盖几个「线上才会暴露」的坑：
-//   1. server_instance_id 必须是 32 字节（客户端硬校验，16 字节直接断连）
-//   2. 节点列表必须 is_all=true（增量语义会让客户端只增不删）
-//   3. 注册/下线要主动广播，不能等对端心跳
-//   4. 同一 device_id 重连时，旧连接的 close 不能把新连接打下线
+// 运行：node test/ws-e2e.test.mjs
 
-import { onRequest } from "../cloud-functions/index.js";
-import { Writer } from "../cloud-functions/_vnt/protobuf.js";
-import {
-  ipToU32,
-  buildPacket,
-  MsgType,
-  parseHeaderFast,
-  HEAD_LENGTH,
-} from "../cloud-functions/_vnt/packet.js";
+import { resetBackend, createMemoryBackend } from "../cloud-functions/_vnt/shared-store.js";
+
+// 必须在 import index.js 之前装好共享后端
+globalThis.__VNT_SHARED_BACKEND__ = createMemoryBackend();
+resetBackend();
+
+const { onRequest } = await import("../cloud-functions/index.js");
+const { Writer } = await import("../cloud-functions/_vnt/protobuf.js");
+const { ipToU32, u32ToIp, buildPacket, MsgType, HEAD_LENGTH } = await import(
+  "../cloud-functions/_vnt/packet.js"
+);
+
+const NET = "e2e-net";
+const GATEWAY = "10.26.2.1";
+const TOKEN = "test-admin-token";
+const ENV = { VNT_NETWORK: NET, VNT_GATEWAY: GATEWAY, VNT_ADMIN_TOKEN: TOKEN };
+
+let passed = 0;
+let failed = 0;
+
+function check(name, cond, detail) {
+  if (cond) {
+    passed++;
+    console.log(`  ✓ ${name}`);
+  } else {
+    failed++;
+    console.log(`  ✗ ${name}${detail ? ` — ${detail}` : ""}`);
+  }
+}
 
 // ---------------------------------------------------------------------------
-// 用最小的 WebSocketPair 替身模拟 EdgeOne 运行时
+// 最小 socket 替身
 // ---------------------------------------------------------------------------
 class FakeSocket {
   constructor() {
@@ -40,7 +61,6 @@ class FakeSocket {
     this.readyState = 3;
     this.emit("close", {});
   }
-  /** 模拟客户端发来一帧 */
   receive(bytes) {
     this.emit("message", { data: bytes });
   }
@@ -51,20 +71,35 @@ class FakeSocket {
   }
 }
 
+let lastSocket = null;
 globalThis.WebSocketPair = class {
   constructor() {
     this.socket = new FakeSocket();
-    this.response = new Response(null, { status: 200 }); // Node 的 Response 不接受 101，这里只做占位
-    // 允许按数组方式解构，验证两种运行时形态都能工作
+    // Node 的 Response 不接受 101，这里只做占位
+    this.response = new Response(null, { status: 200 });
     this[0] = new FakeSocket();
     this[1] = this.socket;
+    lastSocket = this.socket;
   }
 };
 
+/** 建立一条 WS 连接（走真实 onRequest） */
+async function connect(env = ENV) {
+  const ctx = {
+    request: new Request("https://x/", { headers: { upgrade: "websocket" } }),
+    env,
+  };
+  const resp = await onRequest(ctx);
+  return { resp, socket: lastSocket };
+}
+
+/** 让排队的帧处理完（帧是串行链式执行的） */
+const settle = () => new Promise((r) => setTimeout(r, 0));
+
 // ---------------------------------------------------------------------------
-// 帧构造与解析
+// 帧构造
 // ---------------------------------------------------------------------------
-function regFrame({ networkCode, deviceId, ip, name = "pc", registrationMode }) {
+function regFrame({ networkCode = NET, deviceId, ip, name = "pc" }) {
   const reg = new Writer();
   reg.writeString(1, networkCode);
   reg.writeString(2, deviceId);
@@ -72,28 +107,24 @@ function regFrame({ networkCode, deviceId, ip, name = "pc", registrationMode }) 
   reg.writeString(4, name);
   reg.writeString(5, "2.0.12");
   reg.writeUInt32(15, 0);
-  if (registrationMode) reg.writeUInt32(9, registrationMode);
   const req = new Writer();
   req.writeMessage(1, reg);
   return req.finish();
 }
 
-/** 16 字节 PingTurn：now(8) + data_version(8) */
-function pingTurn(dataVersion) {
+function pingTurn(dataVersion = 0) {
   const payload = new Uint8Array(16);
   const view = new DataView(payload.buffer);
-  view.setBigUint64(0, BigInt(Date.now()), false);
+  view.setBigInt64(0, BigInt(Date.now()), false);
   view.setBigUint64(8, BigInt(dataVersion), false);
-  return buildPacket({
-    msgType: MsgType.PingTurn,
-    ttl: 1,
-    gateway: true,
-    payload,
-  }).toUint8Array();
+  return buildPacket({ msgType: MsgType.PingTurn, ttl: 1, gateway: true, payload }).toUint8Array();
 }
 
-/** 通用 protobuf 字段遍历（测试用，不依赖实现） */
+// ---------------------------------------------------------------------------
+// 解析
+// ---------------------------------------------------------------------------
 function parseFields(bytes) {
+  const out = [];
   let pos = 0;
   const rv = () => {
     let v = 0n;
@@ -105,319 +136,315 @@ function parseFields(bytes) {
       if (!(x & 0x80)) return Number(v);
     }
   };
-  const out = [];
   while (pos < bytes.length) {
     const tag = rv();
-    out.push({ field: tag >> 3, wire: tag & 7 });
-    const w = tag & 7;
-    if (w === 0) rv();
-    else if (w === 1) pos += 8;
-    else if (w === 5) pos += 4;
-    else if (w === 2) {
-      const len = rv();
-      out[out.length - 1].bytes = bytes.subarray(pos, pos + len);
-      pos += len;
-    } else break;
-  }
-  return out;
-}
-
-const ipU32 = (v) => `${(v >>> 24) & 255}.${(v >>> 16) & 255}.${(v >>> 8) & 255}.${v & 255}`;
-
-/** 解出 RegResponseMsg（外层 field=1） */
-function parseRegResp(bytes) {
-  const outer = parseFields(bytes);
-  const msg = outer.find((f) => f.field === 1 && f.wire === 2);
-  if (!msg) return null;
-  const out = {};
-  // 手工按字段号取值（fixed32 / varint / bytes）
-  let pos = 0;
-  const buf = msg.bytes;
-  const rv = () => {
-    let v = 0n;
-    let s = 0n;
-    while (true) {
-      const x = buf[pos++];
-      v |= BigInt(x & 0x7f) << s;
-      s += 7n;
-      if (!(x & 0x80)) return Number(v);
-    }
-  };
-  while (pos < buf.length) {
-    const tag = rv();
     const field = tag >> 3;
     const wire = tag & 7;
-    if (wire === 0) out[field] = rv();
+    if (wire === 0) out.push({ field, wire, value: rv() });
     else if (wire === 5) {
-      out[field] = (buf[pos] | (buf[pos + 1] << 8) | (buf[pos + 2] << 16) | (buf[pos + 3] << 24)) >>> 0;
+      out.push({
+        field,
+        wire,
+        value: (bytes[pos] | (bytes[pos + 1] << 8) | (bytes[pos + 2] << 16) | (bytes[pos + 3] << 24)) >>> 0,
+      });
       pos += 4;
-    } else if (wire === 1) pos += 8;
-    else if (wire === 2) {
-      const len = rv();
-      out[field] = new Uint8Array(buf.subarray(pos, pos + len));
-      pos += len;
-    } else break;
-  }
-  return out;
-}
-
-/** 解出 ClientSimpleInfoList（PushClientIps 的 payload） */
-function parseClientList(payload) {
-  const out = { list: [], isAll: false, dataVersion: 0, time: 0 };
-  let pos = 0;
-  const buf = payload;
-  const rv = () => {
-    let v = 0n;
-    let s = 0n;
-    while (true) {
-      const x = buf[pos++];
-      v |= BigInt(x & 0x7f) << s;
-      s += 7n;
-      if (!(x & 0x80)) return Number(v);
-    }
-  };
-  while (pos < buf.length) {
-    const tag = rv();
-    const field = tag >> 3;
-    const wire = tag & 7;
-    if (wire === 0) {
-      const v = rv();
-      if (field === 1) out.dataVersion = v;
-      if (field === 3) out.isAll = v !== 0;
-      if (field === 4) out.time = v;
+    } else if (wire === 1) {
+      pos += 8;
+      out.push({ field, wire, value: null });
     } else if (wire === 2) {
       const len = rv();
-      const sub = buf.subarray(pos, pos + len);
+      out.push({ field, wire, value: bytes.subarray(pos, pos + len) });
       pos += len;
-      if (field === 2) {
-        // ClientSimpleInfo { ip=1 fixed32, online=2, client_type=3 }
-        let p = 0;
-        const item = { ip: 0, online: false, clientType: 0 };
-        while (p < sub.length) {
-          let t = 0n;
-          let s = 0n;
-          while (true) {
-            const x = sub[p++];
-            t |= BigInt(x & 0x7f) << s;
-            s += 7n;
-            if (!(x & 0x80)) break;
-          }
-          const ff = Number(t) >> 3;
-          const w = Number(t) & 7;
-          if (w === 5) {
-            item.ip = (sub[p] | (sub[p + 1] << 8) | (sub[p + 2] << 16) | (sub[p + 3] << 24)) >>> 0;
-            p += 4;
-          } else if (w === 0) {
-            let v = 0n;
-            let ss = 0n;
-            while (true) {
-              const x = sub[p++];
-              v |= BigInt(x & 0x7f) << ss;
-              ss += 7n;
-              if (!(x & 0x80)) break;
-            }
-            if (ff === 2) item.online = Number(v) !== 0;
-            if (ff === 3) item.clientType = Number(v);
-          } else break;
-        }
-        out.list.push(item);
-      }
     } else break;
   }
   return out;
 }
 
-// ---------------------------------------------------------------------------
-// 断言工具
-// ---------------------------------------------------------------------------
-let failed = 0;
-function check(name, cond, detail) {
-  if (cond) {
-    console.log(`  ✓ ${name}`);
-  } else {
-    failed++;
-    console.log(`  ✗ ${name}${detail ? ` — ${detail}` : ""}`);
+function parseRegResp(bytes) {
+  const reg = parseFields(bytes).find((f) => f.field === 1 && f.value instanceof Uint8Array);
+  return reg ? parseFields(reg.value) : null;
+}
+
+/** 按字段号取值（不要用数组下标——字段可能被 proto3 跳过） */
+function fieldOf(fields, no) {
+  return fields.find((f) => f.field === no);
+}
+
+function decodeClientList(payload) {
+  const out = { isAll: false, ips: [] };
+  for (const f of parseFields(payload)) {
+    if (f.field === 3) out.isAll = f.value !== 0;
+    if (f.field === 2 && f.value instanceof Uint8Array) {
+      const ipField = parseFields(f.value).find((x) => x.field === 1);
+      if (ipField) out.ips.push(u32ToIp(ipField.value));
+    }
+  }
+  return out;
+}
+
+async function admin(path, init = {}) {
+  const headers = new Headers(init.headers || {});
+  if (!headers.has("Authorization") && TOKEN) headers.set("Authorization", `Bearer ${TOKEN}`);
+  const req = new Request(`https://x${path}`, { ...init, headers });
+  return onRequest({ request: req, env: ENV });
+}
+
+// ===========================================================================
+console.log("管理 API：设备登记");
+
+{
+  const res = await admin("/admin");
+  check("GET /admin 返回说明与设备列表", res.status === 200);
+  const body = await res.json();
+  check("说明页带网络编号", body.networkCode === NET, JSON.stringify(body.networkCode));
+}
+
+{
+  const req = new Request("https://x/admin/devices");
+  const res = await onRequest({ request: req, env: { ...ENV, VNT_ADMIN_TOKEN: "" } });
+  check("未配置 VNT_ADMIN_TOKEN 时管理接口不可用（503）", res.status === 503, `实际 ${res.status}`);
+}
+
+{
+  const req = new Request("https://x/admin/devices", { headers: { Authorization: "Bearer wrong" } });
+  const res = await onRequest({ request: req, env: ENV });
+  check("token 错误返回 401", res.status === 401, `实际 ${res.status}`);
+}
+
+{
+  const res = await admin("/admin/devices", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ deviceId: "lede", ip: "10.26.2.2", name: "路由器" }),
+  });
+  check("登记设备返回 201", res.status === 201, `实际 ${res.status}`);
+  const body = await res.json();
+  check("返回登记详情", body.device?.deviceId === "lede" && body.device?.ip === "10.26.2.2");
+  check("提示无需等待缓存过期", typeof body.hint === "string" && body.hint.includes("立即"));
+}
+
+{
+  const res = await admin("/admin/devices", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ deviceId: "dup", ip: "10.26.2.2" }),
+  });
+  check("重复 ip 登记返回 409", res.status === 409, `实际 ${res.status}`);
+}
+
+{
+  const res = await admin("/admin/devices", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ deviceId: "bad", ip: "10.26.2.1" }),
+  });
+  check("网关地址不可登记（409）", res.status === 409, `实际 ${res.status}`);
+}
+
+{
+  const res = await admin("/admin/devices", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ deviceId: "pc2", ip: "10.26.2.3", name: "笔记本" }),
+  });
+  check("登记第二台设备成功", res.status === 201);
+}
+
+{
+  const res = await admin("/admin/devices");
+  const body = await res.json();
+  check("列表包含两台已登记设备", body.devices.length === 2, `实际 ${body.devices.length}`);
+  check("已登记未连接的设备 online=false", body.devices.every((d) => d.online === false));
+}
+
+// ===========================================================================
+console.log("\n客户端注册（需先登记）");
+
+{
+  const { resp, socket } = await connect();
+  check("升级请求返回 Response", resp instanceof Response);
+
+  socket.receive(regFrame({ deviceId: "nobody", ip: ipToU32("10.26.2.9") }));
+  await settle();
+  const frames = socket.drain();
+  check("未登记设备被拒绝", frames.length >= 1, `收到 ${frames.length} 帧`);
+  const text = new TextDecoder().decode(frames[0]);
+  check("错误信息提示需要先登记", text.includes("未登记"), text.slice(0, 80));
+}
+
+{
+  const { socket } = await connect();
+  socket.receive(regFrame({ deviceId: "lede", ip: ipToU32("10.26.2.99") }));
+  await settle();
+  const text = new TextDecoder().decode(socket.drain()[0]);
+  check("ip 与登记不符被拒绝", text.includes("不符"), text.slice(0, 80));
+}
+
+{
+  const { socket } = await connect();
+  socket.receive(regFrame({ deviceId: "lede", ip: ipToU32("10.26.2.2") }));
+  await settle();
+  const frames = socket.drain();
+  const reg = parseRegResp(frames[0]);
+  check("已登记设备注册成功", !!reg);
+  const ipField = fieldOf(reg, 1);
+  check("分配的 ip 与登记一致", ipField && u32ToIp(ipField.value) === "10.26.2.2", ipField ? u32ToIp(ipField.value) : "(缺 ip 字段)");
+  const sid = reg.find((f) => f.field === 8 && f.value instanceof Uint8Array);
+  check("server_instance_id 恰好 32 字节", sid?.value.length === 32, `实际 ${sid?.value.length}`);
+  check("未声明 multi_link_supported", reg.find((f) => f.field === 9) === undefined);
+}
+
+// ===========================================================================
+console.log("\n节点列表与打洞信令");
+
+let sockA;
+let sockB;
+const ipA = ipToU32("10.26.2.2");
+const ipB = ipToU32("10.26.2.3");
+
+{
+  const a = await connect();
+  a.socket.receive(regFrame({ deviceId: "lede", ip: ipA }));
+  await settle();
+  a.socket.drain();
+  sockA = a.socket;
+
+  const b = await connect();
+  b.socket.receive(regFrame({ deviceId: "pc2", ip: ipB }));
+  await settle();
+  sockB = b.socket;
+
+  const bFrames = sockB.drain();
+  const push = bFrames.find((f) => (f[0] & 0x7f) === MsgType.PushClientIps);
+  check("新设备注册后立刻收到节点列表", !!push);
+  if (push) {
+    const list = decodeClientList(push.subarray(HEAD_LENGTH));
+    check("推送为全量 is_all=true", list.isAll === true);
+    check("列表含已在线的 lede", list.ips.includes("10.26.2.2"), list.ips.join(","));
+  }
+
+  const aPush = sockA.drain().find((f) => (f[0] & 0x7f) === MsgType.PushClientIps);
+  check("已有设备无需等心跳即收到新成员", !!aPush);
+}
+
+{
+  sockB.drain();
+  const punch = buildPacket({
+    msgType: MsgType.PunchStart1,
+    ttl: 2,
+    src: ipA,
+    dest: ipB,
+    payload: new Uint8Array([1, 2, 3]),
+  }).toUint8Array();
+  sockA.receive(punch);
+  await settle();
+  const got = sockB.drain();
+  check("打洞信令被转发到对端", got.length === 1, `收到 ${got.length} 帧`);
+  if (got[0]) {
+    check("转发的是 PunchStart1", (got[0][0] & 0x7f) === MsgType.PunchStart1);
+    check("TTL 已递减 2→1", (got[0][1] & 0x0f) === 1, `实际 ${got[0][1] & 0x0f}`);
   }
 }
 
-// ---------------------------------------------------------------------------
-// 建连辅助
-// ---------------------------------------------------------------------------
-async function connect(env, label) {
-  const ctx = {
-    request: new Request("https://x/", { headers: { upgrade: "websocket" } }),
-    env: env || {},
-  };
-  const resp = await onRequest(ctx);
-  if (label) {
-    check(`${label}：升级请求返回的是 Response 而不是自定义对象`, resp instanceof Response, `拿到 ${typeof resp}`);
+{
+  sockB.drain();
+  const turn = buildPacket({
+    msgType: MsgType.Turn,
+    ttl: 15,
+    src: ipA,
+    dest: ipB,
+    payload: new Uint8Array([0xde, 0xad]),
+  }).toUint8Array();
+  sockA.receive(turn);
+  await settle();
+  check("业务流量 Turn 不被中转（纯打洞模式）", sockB.drain().length === 0);
+}
+
+{
+  sockA.drain();
+  sockA.receive(pingTurn(0));
+  await settle();
+  const push = sockA.drain().find((f) => (f[0] & 0x7f) === MsgType.PushClientIps);
+  check("心跳返回节点列表", !!push);
+  if (push) {
+    check("心跳推送为全量", decodeClientList(push.subarray(HEAD_LENGTH)).isAll === true);
   }
-  // acceptWebSocket 内部消费了 pair，这里取全局最近一次创建的 socket
-  return { resp, socket: globalThis.__lastSocket };
 }
 
-// 拦截 FakeSocket 创建，记录最近一个（即 acceptWebSocket 用到的那个）
-const OriginalFake = FakeSocket;
-globalThis.WebSocketPair = class extends OriginalFake {
-  constructor() {
-    super();
-    this.socket = new OriginalFake();
-    this.response = new Response(null, { status: 200 }); // Node 的 Response 不接受 101，这里只做占位
-    this[0] = new OriginalFake();
-    this[1] = this.socket;
-    globalThis.__lastSocket = this.socket;
-  }
-};
+// ===========================================================================
+console.log("\n下线与重连");
 
-// ---------------------------------------------------------------------------
-// 用例
-// ---------------------------------------------------------------------------
-console.log("接入层");
-const env = {};
+{
+  sockB.drain();
+  sockA.close();
+  await settle();
+  await settle();
+  const push = sockB.drain().find((f) => (f[0] & 0x7f) === MsgType.PushClientIps);
+  check("设备断线后对端收到更新", !!push);
 
-const a = await connect(env, "首次连接");
-const aSock = a.socket;
-aSock.receive(regFrame({ networkCode: "e2e-ws", deviceId: "A" }));
-const aReg = parseRegResp(aSock.drain()[0]);
-check("A 注册成功并拿到虚拟 IP", !!aReg && !!aReg[1], JSON.stringify(aReg));
-console.log(`    A 分配 IP: ${ipU32(aReg[1])}  prefix: ${aReg[2]}  gateway: ${ipU32(aReg[3])}`);
-
-check(
-  "server_instance_id 恰好 32 字节（客户端硬校验）",
-  aReg[8] instanceof Uint8Array && aReg[8].length === 32,
-  `实际 ${aReg[8]?.length ?? "缺失"} 字节`,
-);
-check("multi_link_supported 未声明为 true", aReg[9] === undefined, `field9=${aReg[9]}`);
-check("subnet_sync_supported 未声明为 true", aReg[5] === undefined, `field5=${aReg[5]}`);
-
-console.log("\n节点列表");
-const b = await connect(env);
-b.socket.receive(regFrame({ networkCode: "e2e-ws", deviceId: "B", ip: ipToU32("10.26.0.3") }));
-const bAll = b.socket.drain();
-const bReg = parseRegResp(bAll[0]);
-console.log(`    B 分配 IP: ${ipU32(bReg[1])}`);
-
-const bPush = bAll.find((f) => (f[0] & 0x7f) === MsgType.PushClientIps);
-check("新设备注册后立刻收到一次节点列表", !!bPush);
-if (bPush) {
-  const list = parseClientList(bPush.subarray(HEAD_LENGTH));
-  check("注册时推送的是全量快照（is_all=true）", list.isAll === true);
-  check("列表里能看到已在线的 A", list.list.some((i) => i.ip === aReg[1] && i.online));
+  const res = await admin("/admin/devices/lede");
+  check("断线后登记仍保留（可随时重连）", res.status === 200, `实际 ${res.status}`);
 }
 
-const aFrames = aSock.drain();
-const aPush = aFrames.find((f) => (f[0] & 0x7f) === MsgType.PushClientIps);
-check("已有设备无需等心跳就收到新成员（主动广播）", !!aPush);
-if (aPush) {
-  const list = parseClientList(aPush.subarray(HEAD_LENGTH));
-  check("广播内容同样是全量快照", list.isAll === true);
-  check("列表包含新上线的 B", list.list.some((i) => i.ip === bReg[1] && i.online));
+{
+  const res = await admin("/admin/devices/pc2", { method: "DELETE" });
+  check("可删除登记", res.status === 200);
+
+  const { socket } = await connect();
+  socket.receive(regFrame({ deviceId: "pc2", ip: ipB }));
+  await settle();
+  const text = new TextDecoder().decode(socket.drain()[0]);
+  check("删除登记后无法再连接", text.includes("未登记"), text.slice(0, 80));
 }
 
-console.log("\n数据面");
-const turn = buildPacket({
-  msgType: MsgType.Turn,
-  ttl: 15,
-  seq: 7,
-  src: aReg[1],
-  dest: bReg[1],
-  payload: new Uint8Array([0xca, 0xfe]),
-}).toUint8Array();
-b.socket.drain();
-aSock.receive(turn);
-const relayed = b.socket.drain();
-check("A -> B 单播中继成功", relayed.length === 1);
-if (relayed[0]) {
-  check("中继后 dest 不变", parseHeaderFast(relayed[0]).dest === bReg[1]);
-  check("中继后 TTL 递减", parseHeaderFast(relayed[0]).ttl === 14);
-}
-
-console.log("\n心跳");
-aSock.drain();
-aSock.receive(pingTurn(0));
-const hb = aSock.drain();
-const hbPush = hb.find((f) => (f[0] & 0x7f) === MsgType.PushClientIps);
-check("版本过期时心跳返回节点列表", !!hbPush);
-if (hbPush) {
-  check("心跳推送也是全量", parseClientList(hbPush.subarray(HEAD_LENGTH)).isAll === true);
-}
-
-aSock.drain();
-const { registry } = await import("../cloud-functions/_vnt/state.js");
-const currentVersion = registry.find("e2e-ws").dataVersion;
-aSock.receive(pingTurn(currentVersion));
-const hb2 = aSock.drain();
-check(
-  "版本一致时只回 PongTurn（不重复推列表）",
-  hb2.length === 1 && (hb2[0][0] & 0x7f) === MsgType.PongTurn,
-  `收到 ${hb2.map((f) => f[0] & 0x7f).join(",")}`,
-);
-
-console.log("\n重连竞态");
-// 模拟客户端断线重连：新连接先注册，旧连接的 close 后到
-const a2 = await connect(env);
-a2.socket.receive(regFrame({ networkCode: "e2e-ws", deviceId: "A" }));
-a2.socket.drain();
-aSock.close(); // 旧连接关闭
-b.socket.drain();
-const afterOldClose = b.socket.drain();
-const stalePush = afterOldClose.find((f) => (f[0] & 0x7f) === MsgType.PushClientIps);
-check(
-  "旧连接 close 不会把刚重连的新连接标成离线",
-  !stalePush || parseClientList(stalePush.subarray(HEAD_LENGTH)).list.every((i) => i.ip !== aReg[1] || i.online),
-);
-
-console.log("\n下线广播");
-b.socket.drain();
-a2.socket.close();
-const offlinePush = b.socket
-  .drain()
-  .find((f) => (f[0] & 0x7f) === MsgType.PushClientIps);
-check("设备断线后其它设备立刻收到更新", !!offlinePush);
-if (offlinePush) {
-  const list = parseClientList(offlinePush.subarray(HEAD_LENGTH));
-  const peer = list.list.find((i) => i.ip === aReg[1]);
-  check("该设备在列表里被标为离线", !!peer && peer.online === false);
-}
-
-
-// ---------------------------------------------------------------------------
-// 运行时形态自适应：没有 WebSocketPair 时应回落到回调对象
-// ---------------------------------------------------------------------------
+// ===========================================================================
 console.log("\n运行时形态自适应");
+
 {
   const saved = globalThis.WebSocketPair;
   delete globalThis.WebSocketPair;
   try {
     const ctx = {
       request: new Request("https://x/", { headers: { upgrade: "websocket" } }),
-      env: {},
+      env: ENV,
     };
     const result = await onRequest(ctx);
     check(
-      "无 WebSocketPair 时回落到 { websocket: { onopen, onmessage, ... } }",
-      !!result && !!result.websocket && typeof result.websocket.onmessage === "function",
-      `拿到 ${Object.keys(result || {}).join(",")}`,
+      "无 WebSocketPair 时回落到回调对象形态",
+      !!result?.websocket && typeof result.websocket.onmessage === "function",
+      Object.keys(result || {}).join(","),
     );
 
-    // 这条回退路径也要能真正完成注册
     const ws = new FakeSocket();
     result.websocket.onopen(ws);
-    result.websocket.onmessage(ws, regFrame({ networkCode: "legacy-ws", deviceId: "L" }));
+    result.websocket.onmessage(ws, regFrame({ deviceId: "lede", ip: ipA }));
+    await settle();
     const frames = ws.drain();
-    check("回调对象形态同样能完成注册", frames.length >= 1);
+    check("回退形态同样能完成注册", frames.length >= 1);
     if (frames[0]) {
-      const resp = parseRegResp(frames[0]);
-      check("回调对象形态下 server_instance_id 也是 32 字节", resp[8]?.length === 32);
+      const reg = parseRegResp(frames[0]);
+      check("回退形态的 server_instance_id 也是 32 字节", reg.find((f) => f.field === 8)?.value.length === 32);
     }
   } finally {
     globalThis.WebSocketPair = saved;
   }
 }
 
+// ===========================================================================
+console.log("\n健康检查");
+
+{
+  const res = await onRequest({ request: new Request("https://x/health"), env: ENV });
+  check("GET /health 返回 200", res.status === 200);
+  const body = await res.json();
+  check("健康检查标明纯打洞模式", body.mode === "p2p-punch-only", body.mode);
+  check("健康检查带网络编号", body.network === NET);
+  check("健康检查统计已登记设备数", body.registeredDevices === 1, String(body.registeredDevices));
+}
+
 console.log("");
 if (failed > 0) {
-  console.log(`失败 ${failed} 项`);
+  console.log(`失败 ${failed} 项，通过 ${passed} 项`);
   process.exit(1);
 }
-console.log("e2e 全部通过");
+console.log(`e2e 全部通过（${passed} 项）`);

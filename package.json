@@ -9,7 +9,7 @@
   },
   "scripts": {
     "dev": "edgeone pages dev",
-    "test": "node test/protocol.test.js && node test/ws-e2e.test.mjs"
+    "test": "node test/protocol.test.js && node test/shared-state.test.js && node test/ws-e2e.test.mjs"
   },
   "keywords": [
     "vnt",
@@ -18,5 +18,8 @@
     "websocket",
     "overlay-network"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "@edgeone/pages-blob": "^0.0.19"
+  }
 }

@@ -1,15 +1,23 @@
-// VNT 2.x 服务端核心逻辑（纯 EdgeOne 版）
+// VNT 2.x 服务端核心逻辑（EdgeOne · 纯打洞模式）
 //
-// 对照 vnts2 的 src/server/control_server/handler.rs 与
-// src/server/network_state_provider.rs，实现单实例可用的功能子集：
-//   * 注册（普通 / 预注册确认 / 快速注册）与虚拟 IP 分配
-//   * 节点列表推送（PushClientIps）
-//   * Turn 数据中继、广播与选择性广播
-//   * 打洞信令转发（PunchStart1/2、PunchReq/Res）
+// 定位：**只做注册、节点发现与打洞信令转发，不做数据中继。**
+// 客户端之间通过 P2P 直连传输业务流量；服务端只负责让它们"互相看得见"，
+// 并把打洞协商（PunchStart1/2 等）送到对面。
+//
+// 这一定位是有意为之：
+//   * EdgeOne 没有 Durable Object，服务端不承载数据面就不必保证同房间同实例；
+//   * 中继要求实时双向转发，而跨实例投递只能靠轮询（Blob 无推送语义），
+//     轮询的秒级延迟不适合数据面，但对打洞协商（客户端每 5 秒重试）够用。
+//
+// 已实现：
+//   * 注册（普通 / 预注册确认 / 快速注册）—— 客户端指定静态 IP，服务端只校验登记
+//   * 节点列表推送（PushClientIps，恒为全量 is_all=true）
+//   * 打洞信令转发（PunchStart1/2、PunchReq/Res、NodeAnnouncement、DirectConnect*）
 //   * 服务端 Ping/Pong（PingTurn -> PongTurn）与网关 ICMP Echo
 //   * RPC 客户端列表查询
 //
-// 不含：多服务端互联、IKEv2、WireGuard、订阅托管、子网同步。
+// 不含：数据中继（Turn/Broadcast 等业务流量）、多服务端互联、IKEv2、
+//       WireGuard、订阅托管、子网同步。
 
 import {
   NetPacket,
@@ -19,6 +27,8 @@ import {
   ipToU32,
   u32ToIp,
   buildPacket,
+  P2P_SIGNAL_TYPES,
+  RELAY_TYPES,
 } from "./packet.js";
 import {
   decodeRequestMessage,
@@ -27,13 +37,19 @@ import {
   encodeConfirmRegResponse,
   encodeFastRegResponse,
   encodeClientSimpleInfoList,
-  decodeSelectiveBroadcast,
   decodeRpcRequest,
   encodeRpcResponse,
   RegistrationMode,
   ClientType,
 } from "./control-messages.js";
-import { registry, resolveConfig, serverInstanceId } from "./state.js";
+import {
+  registry,
+  resolveConfig,
+  serverInstanceId,
+  REG_NOT_REGISTERED,
+  REG_IP_MISMATCH,
+  REG_IP_INVALID,
+} from "./state.js";
 
 /** 错误码（与 vnts 的 ErrorResponseMsg.code 语义一致） */
 const ERR = {
@@ -42,6 +58,12 @@ const ERR = {
   FORBIDDEN: 403,
   SERVER_ERROR: 500,
 };
+
+/** 是否允许中转业务流量。默认关闭 —— 本项目定位就是纯打洞辅助 */
+function relayEnabled(env) {
+  const v = String(env?.VNT_ALLOW_RELAY ?? "").trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes";
+}
 
 function normalizeBinary(message) {
   if (message instanceof Uint8Array) return message;
@@ -62,13 +84,12 @@ export class Session {
   constructor(env) {
     this.env = env;
     this.config = resolveConfig(env);
+    this.allowRelay = relayEnabled(env);
     this.registered = false;
     this.networkCode = "";
     this.deviceId = "";
     this.ip = 0;
     this.clientType = ClientType.VNT;
-    this.instanceId = "";
-    this.inviteCode = ""; // 可选白名单（VNT_VISIT_CODE）
     this.closed = false;
     this.connToken = undefined;
     this.net = null;
@@ -76,9 +97,9 @@ export class Session {
   }
 
   /**
-   * 白名单校验：VNT_NETWORK_WHITELIST 只能填一个 network_code。
-   * 留空表示不限制；填入后必须完全一致才允许接入。
-   * 不做逗号拆分——多值会被当作一个整体字符串，从而永远匹配不上。
+   * 白名单校验（旧接口，保留用于兼容）。
+   * 现在的准入控制已改为「设备登记制」+ 网络编号来自环境变量，
+   * 不再依赖共享口令 VNT_NETWORK_WHITELIST。
    */
   checkNetworkAllowed(code) {
     const allowed = (this.env.VNT_NETWORK_WHITELIST || "").trim();
@@ -86,8 +107,8 @@ export class Session {
     return allowed === code;
   }
 
-  /** 处理首帧注册请求（同步：解码 + 分配 + 回响应，无需 await） */
-  handleFirstFrame(bytes, send) {
+  /** 处理首帧注册请求。注册要读写共享存储，因此是异步的 */
+  async handleFirstFrame(bytes, send) {
     let decoded;
     try {
       decoded = decodeRequestMessage(bytes);
@@ -111,7 +132,22 @@ export class Session {
     return false;
   }
 
-  handleRegister(reg, send) {
+  /** 把注册失败原因翻译成给用户看的话 */
+  _regErrorText(result, ip) {
+    const ipStr = ip ? u32ToIp(ip) : "(未提供)";
+    switch (result.reason) {
+      case REG_NOT_REGISTERED:
+        return "该 device_id 未登记。请先在服务端登记设备（device_id + ip + 名字）后再连接";
+      case REG_IP_MISMATCH:
+        return `ip 与登记不符（${result.detail || ""}）`;
+      case REG_IP_INVALID:
+        return result.detail || `ip ${ipStr} 无效`;
+      default:
+        return "注册失败";
+    }
+  }
+
+  async handleRegister(reg, send) {
     const { networkCode, deviceId } = reg;
     if (!networkCode) {
       send(encodeErrorResponse(ERR.BAD_REQUEST, "network_code 不能为空"));
@@ -129,10 +165,23 @@ export class Session {
       send(encodeErrorResponse(ERR.BAD_REQUEST, "device_id 长度超过 64"));
       return false;
     }
-    if (!this.checkNetworkAllowed(networkCode)) {
-      send(encodeErrorResponse(ERR.TOKEN_ERROR, `network_code '${networkCode}' 不在白名单`));
+
+    // 网络编号**只来自环境变量**（VNT_NETWORK），客户端必须完全一致。
+    // 这样「网络名」从共享口令变成了服务端配置，不依赖保密性。
+    if (!this.config.networkCode) {
+      send(
+        encodeErrorResponse(
+          ERR.SERVER_ERROR,
+          "服务端未配置网络编号，请在项目环境变量中设置 VNT_NETWORK",
+        ),
+      );
       return false;
     }
+    if (networkCode !== this.config.networkCode) {
+      send(encodeErrorResponse(ERR.TOKEN_ERROR, "network_code 与服务端配置不一致"));
+      return false;
+    }
+
     // 仅接受普通 VNT 客户端（无 IKEv2 / WireGuard / 远程桌面）
     if (reg.clientType !== ClientType.VNT) {
       send(encodeErrorResponse(ERR.FORBIDDEN, "本服务端仅接受 VNT 客户端"));
@@ -142,31 +191,30 @@ export class Session {
     const net = registry.network(networkCode, this.config);
     let result;
     try {
-      result = net.registerDevice({
+      result = await net.registerDevice({
         deviceId,
         clientType: reg.clientType,
         requestedIp: reg.ip,
-        name: reg.name,
-        version: reg.version,
-        keySign: reg.keySign,
-        instanceId: this._instanceIdString(reg.clientInstanceId),
-        ipVariable: reg.ipVariable,
+        send,
       });
     } catch (e) {
       send(encodeErrorResponse(ERR.SERVER_ERROR, `注册失败: ${e.message}`));
       return false;
     }
 
+    if (!result.ok) {
+      send(encodeErrorResponse(ERR.TOKEN_ERROR, this._regErrorText(result, reg.ip)));
+      return false;
+    }
+
     this.registered = true;
     this.networkCode = networkCode;
     this.deviceId = deviceId;
-    this.ip = result.entry.ip;
-    this.ipU32 = result.entry.ip;
+    this.ip = result.ip >>> 0;
+    this.ipU32 = this.ip;
     this.clientType = reg.clientType;
     this.net = net;
-    this.instanceId = result.entry.instanceId;
-    this.connToken = result.entry.connToken;
-    result.entry.sender = send;
+    this.connToken = result.connToken;
 
     const isPreRegister = reg.registrationMode === RegistrationMode.PRE_REGISTER;
     if (isPreRegister) {
@@ -188,69 +236,10 @@ export class Session {
     );
 
     // 注册后立刻推一次全量邻居列表，客户端据此建立打洞目标
-    this._pushClientIps(send, { force: true });
+    this._pushClientIps(send, { time: Date.now() });
     // 其它在线设备也要立即知道有新成员，而不是等它们下次心跳
-    this._broadcastClientIps();
+    await this._broadcastClientIps();
     return true;
-  }
-
-  /**
-   * 向本连接推送节点列表。
-   * @param {(bytes: Uint8Array) => void} send
-   */
-  _pushClientIps(send, { force = false, time = 0 } = {}) {
-    if (!this.net) return false;
-    const list = this.net.fullList(this.ip, this.net.dataVersion, time);
-    if (!list) return false;
-    void force;
-    const payload = encodeClientSimpleInfoList(list);
-    const pkt = buildPacket({
-      msgType: MsgType.PushClientIps,
-      ttl: 1,
-      gateway: true,
-      src: this.net.gateway,
-      dest: this.ip,
-      payload,
-    });
-    send(pkt.toUint8Array());
-    return true;
-  }
-
-  /**
-   * 把最新节点列表广播给本网络其它在线设备。
-   *
-   * 之前只在客户端自己心跳时按 data_version 判断要不要推：一旦某次推送
-   * 因链路抖动丢失，对端就会长期停在陈旧快照上（表现为「明明在线却显示离线」）。
-   * 上下线属于低频事件，直接主动推全量最省事也最可靠。
-   */
-  _broadcastClientIps() {
-    if (!this.net) return;
-    for (const peer of this.net.onlineEntries()) {
-      if (peer.deviceId === this.deviceId) continue;
-      if (typeof peer.sender !== "function") continue;
-      try {
-        const list = this.net.fullList(peer.ip, this.net.dataVersion, 0);
-        const payload = encodeClientSimpleInfoList(list);
-        const pkt = buildPacket({
-          msgType: MsgType.PushClientIps,
-          ttl: 1,
-          gateway: true,
-          src: this.net.gateway,
-          dest: peer.ip,
-          payload,
-        });
-        peer.sender(pkt.toUint8Array());
-      } catch {
-        // 单个对端发送失败不影响其它对端
-      }
-    }
-  }
-
-  _instanceIdString(bytes) {
-    if (!bytes || bytes.length === 0) return "";
-    let s = "";
-    for (let i = 0; i < bytes.length; i++) s += bytes[i].toString(16).padStart(2, "0");
-    return s;
   }
 
   /** 是否处于等待预注册确认状态 */
@@ -269,164 +258,171 @@ export class Session {
     return true;
   }
 
+  /**
+   * 向本连接推送节点列表。
+   *
+   * 恒发全量（is_all=true）：客户端对 is_all=false 走 `map.extend`（只增不删），
+   * 已下线的设备、换过的旧 IP 会永久留在客户端缓存里显示成离线。
+   */
+  _pushClientIps(send, { time = 0 } = {}) {
+    if (!this.net) return false;
+    const list = this.net.exportList(this.ip, time);
+    const payload = encodeClientSimpleInfoList(list);
+    const pkt = buildPacket({
+      msgType: MsgType.PushClientIps,
+      ttl: 1,
+      gateway: true,
+      src: this.net.gateway,
+      dest: this.ip,
+      payload,
+    });
+    send(pkt.toUint8Array());
+    return true;
+  }
+
+  /**
+   * 把最新节点列表广播给本网络其它**在线**设备。
+   * 只推给本实例持有的连接 —— 别的实例由它们自己的心跳周期自行拉取。
+   */
+  async _broadcastClientIps() {
+    if (!this.net) return 0;
+    let sent = 0;
+    for (const [deviceId, send] of this.net.local) {
+      if (deviceId === this.deviceId) continue;
+      const rec = this.net.shared.get(deviceId);
+      if (!rec || !this.net.isOnline(rec)) continue;
+      try {
+        const list = this.net.exportList(rec.ip, 0);
+        const payload = encodeClientSimpleInfoList(list);
+        const pkt = buildPacket({
+          msgType: MsgType.PushClientIps,
+          ttl: 1,
+          gateway: true,
+          src: this.net.gateway,
+          dest: rec.ip,
+          payload,
+        });
+        send(pkt.toUint8Array());
+        sent++;
+      } catch {
+        // 单个对端发送失败不影响其它对端
+      }
+    }
+    return sent;
+  }
+
   /** 处理数据阶段帧（16 字节头 + payload） */
-  handleDataPacket(bytes, send) {
+  async handleDataPacket(bytes, send) {
     if (!this.registered || !this.net) return;
     if (bytes.length < HEAD_LENGTH) return;
 
     const head = parseHeaderFast(bytes);
-    const src = head.src;
-    const dest = head.dest;
 
     // 发往服务端网关
     if (head.gateway) {
-      this._handleGatewayPacket(bytes, head, send);
+      await this._handleGatewayPacket(bytes, head, send);
       return;
     }
 
     // 校验源地址与会话一致，防止伪造
-    if (src !== this.ip) return;
+    if (head.src !== this.ip) return;
 
-    switch (head.msgType) {
-      case MsgType.Turn:
-      case MsgType.Ping:
-      case MsgType.Pong:
-      case MsgType.PunchStart1:
-      case MsgType.PunchStart2:
-      case MsgType.PunchReq:
-      case MsgType.PunchRes:
-      case MsgType.Quic: {
-        if (!_decrTtl(bytes)) return;
-        this._relayTo(dest, bytes);
-        break;
-      }
-      case MsgType.Broadcast: {
-        if (!_decrTtl(bytes)) return;
-        this._broadcast(bytes, src, null);
-        break;
-      }
-      case MsgType.ExcludeBroadcast: {
-        const sel = decodeSelectiveBroadcast(bytes.subarray(HEAD_LENGTH));
-        const inner = new Uint8Array(sel.data);
-        if (inner.length < HEAD_LENGTH) return;
-        if (!_decrTtl(inner)) return;
-        this._broadcast(inner, src, new Set(sel.ips));
-        break;
-      }
-      case MsgType.TargetBroadcast: {
-        const sel = decodeSelectiveBroadcast(bytes.subarray(HEAD_LENGTH));
-        const inner = new Uint8Array(sel.data);
-        if (inner.length < HEAD_LENGTH) return;
-        if (!_decrTtl(inner)) return;
-        const targets = new Set(sel.ips);
-        this._broadcast(inner, src, null, (ip) => targets.has(ip));
-        break;
-      }
-      default:
-        break;
+    const type = head.msgType;
+
+    // 打洞信令：转发给目标（本地直发，跨实例走共享信箱）
+    if (P2P_SIGNAL_TYPES.has(type)) {
+      if (!_decrTtl(bytes)) return;
+      await this._forwardSignal(head.dest, bytes);
+      return;
+    }
+
+    // 业务流量：默认不中转（纯打洞模式）
+    if (RELAY_TYPES.has(type)) {
+      if (!this.allowRelay) return;
+      if (!_decrTtl(bytes)) return;
+      await this._forwardSignal(head.dest, bytes);
+      return;
     }
   }
 
-  /**
-   * 广播。
-   * @param {Uint8Array} bytes 已递减 TTL 的完整包
-   * @param {number} src 发送者虚拟 IP
-   * @param {Set<number>|null} exclude 排除集合
-   * @param {(ip:number)=>boolean} [predicate] 额外目标过滤
-   */
-  _broadcast(bytes, src, exclude, predicate) {
-    for (const entry of this.net.devices.values()) {
-      if (entry.ip === src) continue;
-      if (exclude && exclude.has(entry.ip)) continue;
-      if (predicate && !predicate(entry.ip)) continue;
-      if (!entry.online || typeof entry.sender !== "function") continue;
-      entry.sender(bytes);
-      registry.stats.packetsRelayed++;
-      registry.stats.bytesRelayed += bytes.length;
+  /** 转发一个包到目标虚拟 IP */
+  async _forwardSignal(dest, bytes) {
+    const how = await this.net.deliverSignal(dest, bytes);
+    if (how === "local") {
+      registry.stats.signalsRelayed++;
+    } else {
+      registry.stats.signalsForwarded++;
     }
-  }
-
-  /** 单播中继到目标虚拟 IP */
-  _relayTo(dest, bytes) {
-    const deviceId = this.net.ipToDevice.get(dest);
-    if (!deviceId) return;
-    const target = this.net.devices.get(deviceId);
-    if (!target || !target.online || typeof target.sender !== "function") return;
-    target.sender(bytes);
-    registry.stats.packetsRelayed++;
-    registry.stats.bytesRelayed += bytes.length;
+    registry.stats.bytesSignaled += bytes.length;
   }
 
   /** 处理网关包 */
-  _handleGatewayPacket(bytes, head, send) {
+  async _handleGatewayPacket(bytes, head, send) {
     switch (head.msgType) {
       case MsgType.PingTurn: {
         const payloadLen = bytes.length - HEAD_LENGTH;
         // 8 字节：简单探测，原样回 PongTurn
         if (payloadLen === 8) {
-          const reply = new Uint8Array(bytes);
-          reply[0] = (MsgType.PongTurn & 0x7f) | 0x80;
-          send(reply);
+          send(_pongOf(bytes));
           return;
         }
-        // 16 字节：[now(8)][data_version(8)]，可选携带节点列表
+        // 16 字节：[now(8)][data_version(8)]，版本变化则携带节点列表
         if (payloadLen === 16) {
-          const dataVersion = _readU64(bytes, HEAD_LENGTH + 8);
-          let pushed = false;
-          const net = this.net;
-          // 版本没变就只回 PongTurn（省流）；变了推全量快照。
-          // 增量（is_all=false）会让客户端 extend 合并、只增不删，
-          // 历史条目永远留在缓存里显示成离线，所以这里一律发全量。
-          if (dataVersion !== net.dataVersion) {
-            const now = _readI64(bytes, HEAD_LENGTH);
-            pushed = this._pushClientIps(send, { time: now });
-          }
-          if (!pushed) {
-            const reply = new Uint8Array(bytes);
-            reply[0] = (MsgType.PongTurn & 0x7f) | 0x80;
-            send(reply);
-          }
+          const now = _readI64(bytes, HEAD_LENGTH);
+          let pushed = await this._onHeartbeat(now, send);
+          if (!pushed) send(_pongOf(bytes));
           return;
         }
         return;
       }
       case MsgType.FastReg: {
-        // 快速注册：仅允许在已确认后切换 IP；本实现做最小化处理
-        const resp = encodeFastRegResponse(true);
+        // 快速注册：本实现不做地址变更，直接回成功
         const pkt = buildPacket({
           msgType: MsgType.FastReg,
           ttl: 1,
           gateway: true,
-          payload: resp,
+          payload: encodeFastRegResponse(true),
         });
         send(pkt.toUint8Array());
         return;
       }
       case MsgType.RpcReq: {
+        // 客户端列表查询
+        if (!this.net) return;
         const req = decodeRpcRequest(bytes.subarray(HEAD_LENGTH));
         const list = [];
-        for (const entry of this.net.devices.values()) {
+        for (const rec of this.net.shared.values()) {
           list.push({
-            name: entry.name,
-            version: entry.version,
-            ip: entry.ip,
-            keySign: entry.keySign,
-            online: entry.online,
-            lastConnectedTime: entry.lastConnectedTime,
-            id: entry.deviceId,
-            clientType: entry.clientType,
+            name: rec.n,
+            version: rec.v,
+            ip: rec.ip,
+            keySign: rec.k,
+            online: this.net.isOnline(rec),
+            lastConnectedTime: Math.floor((rec.seen || 0) / 1000),
+            id: rec.id,
+            clientType: rec.t,
           });
         }
-        const payload = encodeRpcResponse({ id: req.id, list });
         const pkt = buildPacket({
           msgType: MsgType.RpcRes,
           ttl: 1,
           gateway: true,
           src: this.net.gateway,
           dest: this.ip,
-          payload,
+          payload: encodeRpcResponse({ id: req.id, list }),
         });
         send(pkt.toUint8Array());
+        return;
+      }
+      case MsgType.PunchReq:
+      case MsgType.PunchRes: {
+        // 这两个是 P2P 通道上的套接字探针。正常情况下客户端直接打到对方公网地址，
+        // 不经服务端；若走了服务端，原样转交给目标。
+        const dest = head.dest;
+        if (dest && dest !== this.net.gateway) {
+          if (!_decrTtl(bytes)) return;
+          await this._forwardSignal(dest, bytes);
+        }
         return;
       }
       case MsgType.Turn: {
@@ -435,25 +431,45 @@ export class Session {
         if (reply) send(reply);
         return;
       }
-      case MsgType.Pong: {
-        // 可选：用于延迟统计，当前仅忽略
+      case MsgType.Pong:
         return;
-      }
       default:
         return;
     }
   }
 
+  /**
+   * 心跳处理：拉取共享视图 → 收信令信箱 → 按需推列表。
+   *
+   * 这是本实现唯一的"轮询入口"。Blob 没有推送语义，跨实例投递只能靠轮询，
+   * 而客户端每 5 秒的心跳正好是天然的轮询周期，不需要后台定时器
+   * （函数实例随时可能被回收，定时器不可靠）。
+   *
+   * @returns {Promise<boolean>} 是否已用列表推送替代了 PongTurn
+   */
+  async _onHeartbeat(now, send) {
+    if (!this.net) return false;
+
+    // 1) 刷新自己的心跳，并同步共享视图（内含 1.2s 节流）
+    await this.net.touch(this.deviceId);
+    await this.net.sync();
+
+    // 2) 取走写给自己的打洞信令（可能来自别的实例）
+    await this.net.drainSignals(this.ip, send);
+
+    // 3) 视图有变化就推一份全量列表
+    return this._pushClientIps(send, { time: now });
+  }
+
   /** 连接关闭清理 */
-  onClose() {
+  async onClose() {
     if (this.closed) return;
     this.closed = true;
-    if (this.net && this.deviceId) {
-      // connToken 不匹配时 offline() 返回 null —— 说明设备已被新连接接管，
-      // 此时绝不能广播「它离线了」，否则会把刚上线的新连接一起打掉。
-      const entry = this.net.offline(this.deviceId, this.connToken);
-      if (entry) this._broadcastClientIps();
-    }
+    if (!this.net || !this.deviceId) return;
+    // connToken 不匹配时 offline() 返回 false —— 说明设备已被新连接接管，
+    // 此时绝不能广播「它离线了」，否则会把刚上线的新连接一起打掉。
+    const changed = await this.net.offline(this.deviceId, this.connToken);
+    if (changed) await this._broadcastClientIps();
   }
 
   peekNetworkCode() {
@@ -466,11 +482,17 @@ export class Session {
 // ---------------------------------------------------------------------------
 
 /** 原地递减 TTL；返回 false 表示应丢弃 */
-function _decrTtl(bytes) {
+export function _decrTtl(bytes) {
   const curr = bytes[1] & 0x0f;
   if (curr <= 1) return false;
   bytes[1] = (bytes[1] & 0xf0) | (curr - 1);
   return true;
+}
+
+function _pongOf(bytes) {
+  const reply = new Uint8Array(bytes);
+  reply[0] = (MsgType.PongTurn & 0x7f) | 0x80;
+  return reply;
 }
 
 /**
@@ -514,7 +536,6 @@ function _icmpEchoReply(bytes, gatewayU32) {
   const inner = new Uint8Array(totalLen);
   inner.set(payload.subarray(0, totalLen));
 
-  // 交换 IP 地址
   inner[12] = (dstIp >>> 24) & 0xff;
   inner[13] = (dstIp >>> 16) & 0xff;
   inner[14] = (dstIp >>> 8) & 0xff;
@@ -524,7 +545,6 @@ function _icmpEchoReply(bytes, gatewayU32) {
   inner[18] = (srcIp >>> 8) & 0xff;
   inner[19] = srcIp & 0xff;
 
-  // ICMP Echo Reply
   inner[ihl] = 0;
   inner[ihl + 1] = 0;
   inner[ihl + 2] = 0;
@@ -533,7 +553,6 @@ function _icmpEchoReply(bytes, gatewayU32) {
   inner[ihl + 2] = (icmpSum >> 8) & 0xff;
   inner[ihl + 3] = icmpSum & 0xff;
 
-  // 重算 IPv4 头校验和
   inner[10] = 0;
   inner[11] = 0;
   const ipSum = _checksum(inner.subarray(0, ihl));
@@ -542,7 +561,7 @@ function _icmpEchoReply(bytes, gatewayU32) {
 
   const pkt = buildPacket({
     msgType: MsgType.Turn,
-    ttl: _maxTtl(bytes),
+    ttl: bytes[1] >> 4 || 15,
     gateway: false,
     seq: ((bytes[4] << 24) | (bytes[5] << 16) | (bytes[6] << 8) | bytes[7]) >>> 0,
     src: dstIp,
@@ -550,10 +569,6 @@ function _icmpEchoReply(bytes, gatewayU32) {
     payload: inner,
   });
   return pkt.toUint8Array();
-}
-
-function _maxTtl(bytes) {
-  return bytes[1] >> 4 || 15;
 }
 
 function _checksum(data) {

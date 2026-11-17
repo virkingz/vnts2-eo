@@ -21,11 +21,20 @@
 
 export const HEAD_LENGTH = 16;
 
-/** 标志位掩码 */
+/** 标志位掩码（对齐 vnt-core 的 ip_packet_protocol.rs） */
 export const FLAG_COMPRESSED = 0x80; // C
-export const FLAG_GATEWAY = 0x40; // G（发往/来自服务端网关）
+export const FLAG_GATEWAY = 0x40; // G
+export const FLAG_FEC = 0x20; // F
+export const FLAG_ETHERNET = 0x10; // E
 
-/** 消息类型（MsgType::*） */
+/**
+ * 消息类型（MsgType::*）—— 数值必须与 vnt-core 严格一致。
+ *
+ * 注意 33 号在真实协议里是**未分配**的（vnt-core 的 msg_type_round_trip
+ * 测试明确断言 `try_from(33u8).is_err()`）。早期版本这里写了
+ * `Application: 33`，属杜撰；客户端的 `try_from` 遇到未知类型会直接报错，
+ * 所以多发一个非法类型比少一个更危险。
+ */
 export const MsgType = {
   Turn: 1,
   Broadcast: 2,
@@ -48,16 +57,51 @@ export const MsgType = {
   RpcRes: 15,
 
   Quic: 17,
-  Application: 33,
+  DirectConnectReq: 20,
+  DirectConnectRes: 21,
 
   FastReg: 22,
   SubnetSyncReq: 23,
   SubnetSyncRes: 24,
   Ikev2Relay: 25,
   WireGuardRelay: 26,
+
+  NodeAnnouncement: 29,
+  DestinationUnreachable: 30,
+
   SubscriptionConfigPush: 31,
   SubscriptionConfigAck: 32,
 };
+
+/**
+ * P2P 打洞信令。纯打洞模式下只放行这些 + 必要的控制帧，
+ * 业务流量（Turn/Broadcast/Quic）一律不转。
+ *
+ * 依据 vnt-core：打洞链路是
+ *   PunchStart1/2      交换 PunchInfo（各自 NAT 信息）
+ *   NodeAnnouncement   交换节点身份（gossip，打洞的前提）
+ *   DirectConnectReq/Res 直连协商
+ *   PunchReq/Res       底层套接字探针（走 P2P 通道，正常不经服务端，
+ *                      这里保留放行以防对端仍走服务端路径）
+ */
+export const P2P_SIGNAL_TYPES = new Set([
+  MsgType.PunchStart1,
+  MsgType.PunchStart2,
+  MsgType.PunchReq,
+  MsgType.PunchRes,
+  MsgType.NodeAnnouncement,
+  MsgType.DirectConnectReq,
+  MsgType.DirectConnectRes,
+]);
+
+/** 业务流量（纯打洞模式下不中转） */
+export const RELAY_TYPES = new Set([
+  MsgType.Turn,
+  MsgType.Broadcast,
+  MsgType.ExcludeBroadcast,
+  MsgType.TargetBroadcast,
+  MsgType.Quic,
+]);
 
 /** IPv4 字符串 -> u32（大端语义，即 10.26.0.1 -> 0x0A1A0001） */
 export function ipToU32(str) {

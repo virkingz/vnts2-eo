@@ -1,162 +1,225 @@
-# vnts2 · EdgeOne
+# vnts2 · EdgeOne（纯 P2P 打洞辅助）
 
-把 VNT 的服务端 **vnts2** 用纯 JavaScript 实现，直接部署到**腾讯 EdgeOne（EdgeOne Makers / Pages）**，
-借助其 Cloud Functions（Node.js 运行时）的 WebSocket 能力，为 [VNT](https://github.com/vnt-dev/vnt)
-客户端提供注册、虚拟 IP 分配、节点发现、P2P 打洞信令与数据中继。
+把 VNT 的服务端 **vnts2** 用纯 JavaScript 实现，部署到**腾讯 EdgeOne（Makers）**，
+借助 Cloud Functions（Node.js）的 WebSocket 能力，为 [VNT](https://github.com/vnt-dev/vnt)
+客户端提供**注册、虚拟 IP 校验、节点发现与 P2P 打洞信令转发**。
+
+> **本项目不中转业务流量。** 客户端之间通过 P2P 直连传输数据，
+> 服务端只负责让它们"互相看得见"，并把打洞协商送到对面。
+> 这既是定位，也是平台约束下的必然选择（见下方说明）。
 
 参考实现：
 - [vnt-dev/vnts](https://github.com/vnt-dev/vnts) —— 官方 Rust 服务端 vnts2（协议权威来源）
-- [Teariy/vnts-cf](https://github.com/Teariy/vnts-cf) —— Cloudflare Worker 版 vnts（本项目的思路来源）
-
-> 本项目对齐的是**当前 VNT 2.x 协议**（客户端 vnt-core 2.0.12 / 服务端 vnts2 2.0.9），
-> 不是 vnts-cf 使用的 1.x 老协议。
 
 ---
 
-## 与 vnts-cf 的关键差异
+## 一句话说明为什么服务端做不了中继
 
-| 维度 | vnts-cf | 本项目 |
+EdgeOne 的 Cloud Functions 是**请求级无状态**的，没有 Durable Object 那样的全局单例。
+同一网络的客户端可能被调度到**不同函数实例**上，而跨实例投递只能靠轮询
+（Blob 对象存储没有推送语义）。轮询的秒级延迟对"打洞协商"够用
+（客户端每 5 秒重试一轮），但对"数据中继"不够 —— 中继要求实时双向转发。
+
+所以本项目**只做控制面**。这反而更贴近 VNT 的设计初衷：
+P2P 直连才是主路径，服务端中继只是打不通时的兜底。
+
+---
+
+## 架构
+
+```
+                         ┌──────────────────────────────┐
+   设备 A ──WSS──┐       │  EdgeOne Cloud Function 实例  │
+                 ├──────▶│  （本项目的 index.js）         │
+   设备 B ──WSS──┘       └──────────┬───────────────────┘
+                                    │ 读写
+                          ┌─────────▼─────────┐
+                          │  EdgeOne Blob     │  ← 跨实例共享
+                          │  设备登记 + 信令信箱 │
+                          └───────────────────┘
+
+   打洞成功后：设备 A ◀═══════ P2P 直连 ═══════▶ 设备 B
+                          （完全不经过 EdgeOne）
+```
+
+三个要点：
+
+1. **设备登记制**。设备由管理 API 预先登记（`deviceId` + `ip` + 名字），
+   客户端注册时必须报出已登记的 `deviceId` 与 `ip` 且**完全匹配**。
+2. **共享设备表**。所有实例读写同一份 Blob，因此设备**跨实例可见**，
+   不存在"两台设备各自连到不同实例、互相看不见"的问题。
+3. **信令信箱**。打洞信令（`PunchStart1/2` 等）若目标不在本实例，
+   就写进共享信箱，由对端实例在心跳时取走投递。
+
+---
+
+## 为什么用 Blob 而不是 KV
+
+| | KV | Blob |
 |---|---|---|
-| 运行平台 | Cloudflare Worker + **Durable Object** | EdgeOne **Cloud Functions**（Node.js） |
-| 房间状态 | Durable Object 保证全局唯一、同房间必定同一实例 | **无等价原语**，只能依赖单实例内存（见下方限制） |
-| 协议版本 | VNT 1.x（12 字节头 + RSA 握手） | **VNT 2.x**（16 字节头 + 裸 protobuf 控制消息） |
-| 依赖 | protobufjs、wrangler | **零运行时依赖**，自制最小 protobuf 编解码 |
-| 入口 | `export default { fetch }` | `export const onRequest` 返回 **`WebSocketPair` 的 `response`** |
+| **运行环境** | **仅 Edge Functions** | Edge Functions / **Cloud Functions** |
+| 一致性 | 最终一致（边缘缓存最长 60s） | 可选**强一致读** `{consistency:"strong"}` |
+| 单值上限 | 1 MB | 25 MB |
 
-**为什么不能照搬 vnts-cf 的架构？**
-Cloudflare Durable Object 能用 `idFromName(roomId)` 把同一网络的客户端**强制定位到同一个进程**，
-房间状态（`Map<ip, connection>`）天然全局一致。EdgeOne 没有这个原语——官方文档明确说明
-Cloud Functions 是**请求级无状态**：「每次请求独立分配执行环境，用完即回收，
-请求之间不保留任何内存状态」。因此本项目只能在**单个函数实例内**维护房间状态。
+**KV 用不了** —— Edge Functions 的 V8 运行时不支持 WebSocket，
+而本服务端必须跑在 Cloud Functions 上。Blob 是 Cloud Functions 唯一可用的持久化存储。
+
+强一致读这一项也很关键：登记设备后客户端**可以立即连接**，不需要等 60 秒缓存过期。
 
 ---
 
-## ⚠️ 必读：EdgeOne 形态下的固有限制
+## 快速开始
 
-在「纯 EdgeOne、零外部依赖」的前提下，以下限制**无法通过代码消除**，请在部署前确认可接受：
+### 1. 部署
 
-1. **同一网络的客户端可能落在不同实例上。**
-   每个实例各自维护一份房间表。若 A、B 两客户端连到不同实例，它们**互相看不见**，
-   也无法通过服务端中继互通。缓解手段：
-   - 小规模自用（同一网络 2~5 台设备）时，EdgeOne 通常复用同一实例，实测多数情况可用；
-   - 若必须保证汇聚，请**升级部署形态**：把 `CLOUDFLARE` 那类架构换成 Cloudflare，或
-     在 `state.js` 的注册表外挂一个共享存储（本项目预留了扩展点，见「扩展」一节）。
+推到 GitHub 后在 [EdgeOne Makers 控制台](https://console.cloud.tencent.com/edgeone/pages) 关联仓库即可。
+构建命令与输出目录**都留空**（本项目没有静态产物）。
 
-2. **虚拟 IP 可能重复。**
-   两个实例各自分配 IP，都可能给出 `10.26.0.2`。这是限制 1 的直接后果。
+> ⚠️ **根目录不能放 `index.html`。** EdgeOne 的路由规则是「静态资源优先于函数」，
+> 放了就会把 `/` 的 WebSocket 升级请求一起吃掉。本仓库根目录刻意不放任何 HTML。
 
-3. **连接生命周期受限。**
-   - Cloud Functions 单次执行默认上限 30s，本项目在 `edgeone.json` 中设为 **120s**（可配置上限）；
-   - EdgeOne 站点层 WebSocket 空闲超时最长 **300s**；
-   - 只支持 HTTP/1.1 的 WebSocket，**不支持 HTTP/2 的 WebSocket**。
-   长连接会被平台按上述阈值回收；VNT 客户端会自动重连，但重连后可能落到新实例。
-   **建议客户端把心跳间隔设在 60s 以内**，避免触发空闲超时。
+### 2. 配置环境变量
 
-4. **不含多服务端互联、IKEv2、WireGuard、订阅托管、子网同步。**
-   这些在官方 vnts2 里依赖持久化数据库与多机协调，超出纯 EdgeOne 单实例的内存模型。
+在「项目设置 → 环境变量」中配置：
 
-> 如果你的诉求是「稳定可用的生产级 VNT 服务端」，仍推荐直接部署官方 vnts2
-> （任意可运行二进制的 VPS/容器）。本项目的定位是**零成本、免运维的边缘尝试**。
+| 变量 | 必填 | 说明 |
+|---|---|---|
+| `VNT_NETWORK` | ✅ | **网络编号，只支持一个**。客户端配置里的 `network_code` 必须与它完全一致 |
+| `VNT_ADMIN_TOKEN` | ✅ | 管理接口令牌。**不配置则 `/admin` 完全不可用**（不会放开） |
+| `VNT_GATEWAY` | | 虚拟网关，默认 `10.26.0.1` |
+| `VNT_NETMASK` | | 虚拟子网掩码，默认 `255.255.255.0` |
+| `VNT_ALLOW_RELAY` | | 设为 `1` 时中继业务流量（默认关闭） |
+
+### 3. 登记设备
+
+**这是与其它 VNT 服务端最大的不同：不做 DHCP，设备必须预先登记。**
+
+```bash
+# 登记一台设备
+curl -X POST "https://你的域名/admin/devices" \
+  -H "Authorization: Bearer 你的VNT_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"deviceId":"lede","ip":"10.26.2.2","name":"路由器"}'
+
+# 查看已登记设备
+curl "https://你的域名/admin/devices" -H "Authorization: Bearer 你的VNT_ADMIN_TOKEN"
+
+# 删除登记
+curl -X DELETE "https://你的域名/admin/devices/lede" -H "Authorization: Bearer 你的VNT_ADMIN_TOKEN"
+```
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | `/admin/devices` | 新增/更新登记，body: `{ deviceId, ip, name }` |
+| `GET` | `/admin/devices` | 列出全部登记（含在线状态） |
+| `GET` | `/admin/devices/{id}` | 查询单台 |
+| `DELETE` | `/admin/devices/{id}` | 删除登记（之后该设备连不上） |
+| `GET` | `/admin` | 说明页 + 设备列表 |
+
+登记后**立即生效**（Blob 强一致读），无需等待。
+
+### 4. 客户端接入
+
+```toml
+# config.toml
+server = ["wss://你的域名:443"]
+network_code = "你的VNT_NETWORK"     # 必须与服务端一致
+device_id = "lede"                   # 必须与登记的一致
+device_mode = "tun"
+ip = "10.26.2.2"                     # 必须与登记的一致（静态 IP）
+```
+
+对应命令行：
+
+```bash
+vnt -s wss://你的域名:443 \
+    -n 你的VNT_NETWORK \
+    -d lede \
+    -i 10.26.2.2
+```
 
 ---
 
-## 踩过的坑（部署前务必看）
+## ⚠️ 地址必须带端口
 
-这些都是实际调试 VNT 真实客户端时踩到的，不是理论风险。按「症状 → 原因」排列。
+客户端解析地址时强制要求 `host:port` 形式。写成 `wss://你的域名` 会直接报
+`invalid server address "...": address has no port`，而且**根本不发起连接**
+（连握手都没有，服务端日志一片空白）。
+
+必须写成 **`wss://你的域名:443`**。尾部的 `/` 也会被当成主机名的一部分，报同样的错。
+
+---
+
+## 踩过的坑
+
+都是实际对接真实 VNT 客户端时踩到的，不是理论风险。
 
 ### 1. 客户端一直「未连接」，服务端毫无日志
-
-**地址没带端口。** 见上面「客户端接入」——必须 `wss://域名:443`。
-这种错客户端连握手都不会发，所以服务端完全看不到请求，最容易误判成「edgeone 挂了」。
+地址没带端口。见上一节。
 
 ### 2. 握手失败，返回 200 HTML 或直接报错
-
-**WebSocket 升级的返回值形态写错了。** EdgeOne 上见过两种约定，两边不通用：
+WebSocket 升级的返回值形态写错了。EdgeOne 上见过两种约定，**两边不通用**：
 
 ```js
-// A) 官方 Node Functions 文档 / 官方模板的写法
+// A) 官方 Node Functions 文档 / 官方模板
 const { socket, response } = new WebSocketPair();
 socket.addEventListener("message", ...);
 return response;
 
-// B) 回调对象（部分文档 / 边缘函数形态）
+// B) 回调对象
 return { websocket: { onopen, onmessage, onclose, onerror } };
 ```
 
-把 A 写成 B（或反过来）都会握手失败。本仓库 `cloud-functions/index.js`
-**做能力探测**：有 `WebSocketPair` 就用 A，没有才回落 B；
-A 内部还同时兼容 EdgeOne 的 `{socket, response}` 与 Cloudflare 的 `[client, server]`。
-`/health` 返回的 `wsMode` 字段会告诉线上当前用的是哪一种。
+本仓库**做能力探测**：有 `WebSocketPair` 用 A，否则回落 B。
+`/health` 的 `wsMode` 字段会告诉你线上走的是哪一种。
 
-### 3. 部署后 `/` 访问不到函数，返回静态文件或 404
-
-**别在仓库根目录放 `index.html`。** EdgeOne 的路由规则是
-「**静态资源优先于 Cloud Functions**」——只要根目录有 `index.html`，
-访问 `/` 永远命中静态文件，WebSocket 升级请求也被它吃掉。
-本仓库根目录刻意不放任何 HTML，状态页由函数自己生成。
+### 3. 部署后 `/` 访问不到函数
+根目录有 `index.html`。静态资源优先于函数，把 `/` 的升级请求吃掉了。
 
 ### 4. 注册成功后立刻断连
-
-**`server_instance_id` 长度不对。**
-客户端（vnt-core `control_message.rs`）硬性校验该字段：
-非空时**必须恰好 32 字节**，否则直接 `bail!` 并断开。原来写 16 字节，
-现象就是「客户端显示已连接，一秒后掉线，无限重试」。
+`server_instance_id` 长度不对。客户端硬校验该字段：
+**非空时必须恰好 32 字节**，否则直接断开。现象是"显示已连接，一秒后掉线，无限重试"。
 
 ### 5. 客户端显示「在线 0 / 离线 N」，但服务端看全都在线
+节点列表用了增量语义（`is_all=false`）。客户端对 `is_all=false` 走
+`map.extend(...)` —— **只增不删**，已下线的设备、换过的旧 IP 会永久留在缓存里
+显示成离线。必须每次都发 `is_all=true` 的全量快照。
 
-**节点列表用了增量语义（`is_all=false`）。**
-客户端 `update_client_simple_list` 对 `is_all=false` 走的是 `map.extend(...)`
-—— **只增不删**。已经下线的设备、换网段前的旧 IP 会永远留在客户端缓存里显示成离线。
-必须每次都发 `is_all=true` 的全量快照，客户端才会整体替换。
-
-### 6. 对端上下线后，这边要等很久才刷新
-
-**上下线没有主动广播。** 只靠客户端下次心跳带旧版本号去「碰」才推送，
-一旦某次丢包或连接切换，对端就长期停在陈旧快照上。
-本仓库在注册成功、连接断开时都会立即向同网络其它设备推一次全量列表。
+### 6. 对端上下线后很久才刷新
+上下线没有主动广播，只靠客户端下次心跳带旧版本号去"碰"。本仓库在注册成功、
+连接断开时都会立即向同网络其它设备推一次全量列表。
 
 ### 7. 客户端重连后马上又变离线
+旧连接的 close 回调把新连接打下了线。客户端重连的时序常常是
+"新连接先注册成功，旧连接的 close 才姗姗来迟"。本仓库给每次注册分配了
+`connToken`，close 时比对令牌，不匹配就忽略。
 
-**旧连接的 close 回调把新连接打下了线。**
-客户端重连的时序常常是「新连接先注册成功，旧连接的 close 才姗姗来迟」。
-如果 `offline()` 只按 `device_id` 定位，就会把刚上线的新连接一起标成离线。
-本仓库给每次注册分配了 `connToken`，close 时比对令牌，不匹配就忽略。
-
-### 8. 云函数报「执行超时」或进程被回收
-
+### 8. 云函数报执行超时
 `edgeone.json` 里 `cloudFunctions.nodejs.maxDuration` 默认 **30 秒**，
-可配范围 10–120。WebSocket 长连接必须调到上限 120，否则连接会被打断。
+可配 10–120。WebSocket 长连接必须调到上限。
 
-### 9. 国内访问慢或连不上
+### 9. 国内访问慢
+默认测试域名（`*.edgeone.app`）走**海外节点**。要在中国大陆有低延迟，
+必须绑定**已备案**的自定义域名并选择中国大陆加速区域。
 
-EdgeOne 的默认测试域名（`*.edgeone.app`）走**海外节点**。
-要在中国大陆有低延迟，必须绑定**已备案**的自定义域名并选择中国大陆加速区域。
-
-### 10. 两台设备互相看不见（最常见，也最难解）
-
-**这是平台形态的固有限制，不是 bug。** edgeone 没有 Durable Object 那样的全局单例，
-同一 `network_code` 的两个客户端可能被调度到**不同函数实例**，各自维护一份房间表。
-现象是：各自都显示「已连接」，但设备列表里只有自己。
-即使同实例，连接因 300s 空闲超时被回收后重连，也可能换到别的实例。
-
-**缓解**：设备数少（2~5 台）、心跳间隔 60s 以内、尽量同一地区；
-**根治**：换用 Durable Object 形态（见同作者的 Cloudflare Worker 版），
-或按「扩展」一节接入共享存储 + 发布订阅。
+### 10. 消息类型编号不要杜撰
+VNT 2.x 的 `MsgType` 里，**33 号是未分配的**（客户端 `try_from(33u8)` 会报错）。
+早期版本这里写了 `Application: 33`，属杜撰 —— 多发一个非法类型比少一个更危险。
 
 ---
 
-## 与真实客户端的兼容性核对清单
+## 兼容性核对清单
 
 改协议相关代码后，建议逐条确认（都是客户端的硬约束）：
 
-| 约束 | 值 | 校验位置 |
-|---|---|---|
-| `server_instance_id` | 空或**恰好 32 字节** | `vnt-core/src/protocol/control_message.rs` |
-| `multi_link_supported` | 建议 `false`（本实现按单连接建模） | 同上，客户端据此决定开几条连接 |
-| `MultiLink` 数据包 | **不要发** | 客户端 `multi_link_supported=false` 时会拒绝 |
-| `ClientSimpleInfoList.is_all` | 推送时恒为 `true` | `context/mod.rs::update_client_simple_list` |
-| 帧头长度 | 16 字节（VNT 2.x） | `ip_packet_protocol.rs` |
-| 消息类型编号 | `PushClientIps = 13` 等 | 同上，见 `packet.js` 的 `MsgType` |
+| 约束 | 值 |
+|---|---|
+| `server_instance_id` | 空或**恰好 32 字节** |
+| `multi_link_supported` | 建议 `false`（本实现按单连接建模） |
+| `ClientSimpleInfoList.is_all` | 推送时恒为 `true` |
+| 帧头长度 | 16 字节（VNT 2.x） |
+| `MsgType` 取值 | 必须与 vnt-core 一致，33 号未分配 |
+| 打洞信令 | `PunchStart1/2` 等必须由服务端转发（`ttl=2`，只够一跳） |
 
 ---
 
@@ -164,161 +227,52 @@ EdgeOne 的默认测试域名（`*.edgeone.app`）走**海外节点**。
 
 ```
 vnts2-edgeone/
-├── cloud-functions/            # EdgeOne 函数目录（目录前缀不进 URL）
-│   ├── index.js                # WebSocket 入口 + 状态页 + /health
-│   └── _vnt/                   # 以下划线开头 = 内部模块，不生成路由
-│       ├── protobuf.js         # 最小 protobuf3 读写
-│       ├── packet.js           # VNT 2.x 16 字节帧头
-│       ├── control-messages.js # 控制消息编解码
-│       ├── state.js            # 网络（房间）注册表
-│       └── server.js           # 服务端核心逻辑
-├── test/protocol.test.js       # 协议自测（Node 内置 assert，无依赖）
-├── test/ws-e2e.test.mjs        # 接入层 e2e（含真实客户端硬约束的回归）
-├── edgeone.json                # EdgeOne 项目配置
-└── package.json
+├── cloud-functions/              # EdgeOne 函数目录（目录前缀不进 URL）
+│   ├── index.js                  # WebSocket 入口 + 状态页 + /health + /admin 分发
+│   └── _vnt/                     # 下划线开头 = 内部模块，不生成路由
+│       ├── admin.js              # 设备登记管理 API
+│       ├── protobuf.js           # 最小 protobuf3 读写
+│       ├── packet.js             # VNT 2.x 16 字节帧头 + MsgType
+│       ├── control-messages.js   # 控制消息编解码
+│       ├── shared-store.js       # Blob 后端（含内存降级）
+│       ├── state.js              # 共享设备表 + 本实例连接表
+│       └── server.js             # 服务端核心逻辑
+├── test/
+│   ├── protocol.test.js          # 协议 + 登记 + 端到端（31 项）
+│   ├── shared-state.test.js      # 跨实例共享（11 项）
+│   └── ws-e2e.test.mjs           # 接入层 e2e（41 项）
+├── edgeone.json
+├── package.json
+└── README.md
 ```
 
-> **根目录不要放 `index.html`。** 见「踩过的坑」第 3 条：静态资源优先于函数，
-> 放了就会把 `/` 的 WebSocket 升级请求一起吃掉。
+---
 
-## 部署
-
-### 方式一：Git 集成（推荐，也是唯一免交互的方式）
-
-1. 把本目录推到 GitHub 仓库（本仓库：`git@github.com:virkingz/vnts2-eo.git`）；
-2. 登录 [EdgeOne Makers 控制台](https://console.cloud.tencent.com/edgeone/pages) →
-   新建项目 → 关联该仓库 → 直接部署。
-   - 构建命令：留空
-   - 输出目录：留空（本项目没有静态产物）
-3. 部署完成后先验证非 WS 部分：浏览器打开 `https://你的域名/health`，应返回 JSON。
-4. 再验证 WS 部分：浏览器控制台执行
-   ```js
-   const ws = new WebSocket("wss://你的域名:443");
-   ws.onopen = () => console.log("open ok");
-   ws.onerror = (e) => console.log("failed", e);
-   ```
-   能打印 `open ok` 说明 WebSocket 通了（随后会因为不是合法 VNT 注册帧被服务端忽略，属正常）。
-5. 最后接真实客户端：`vnt -s wss://你的域名:443 -n my-net -d my-pc`。
-
-> **关于 WebSocket 开关**：EdgeOne 的**站点级**加速里有一个 WebSocket 开关
-> （默认关闭，超时可配 1–300s）。这个开关属于「站点加速」配置，与 Pages 项目本身
-> 不是同一层。如果第 4 步连不上，先确认这一点；
-> 使用 `*.edgeone.app` 默认域名时该开关不可改，只能保证默认行为。
-
-### 方式二：CLI
-
-```bash
-npm install -g edgeone
-edgeone login               # 交互式登录，需在本地终端执行
-edgeone pages link          # 关联项目（同步环境变量时需要）
-edgeone pages dev           # 本地开发，http://localhost:8088
-edgeone pages deploy        # 部署
-```
-
-### 本地验证
+## 测试
 
 ```bash
 npm test
 ```
 
-包含两组：
-- `test/protocol.test.js` —— 27 项协议/流程自测（编解码、IP 分配、白名单、中继）
-- `test/ws-e2e.test.mjs` —— 23 项接入层 e2e，覆盖 `server_instance_id` 长度、
-  `is_all` 语义、上下线主动广播、心跳、重连竞态这些**只有真实客户端才会暴露**的约束
+- `protocol.test.js` —— 编解码、设备登记、保留地址校验、打洞信令、不中转业务流量
+- `shared-state.test.js` —— **跨实例**：设备表共享、并发写不丢数据、信令经信箱投递
+- `ws-e2e.test.mjs` —— 接入层：`/admin` API、注册校验、两种 WS 形态、健康检查
+
+本地跑时 Blob 会降级为内存后端（没有 EdgeOne 凭据），跨实例测试用共享的内存后端模拟。
 
 ---
 
-## 环境变量
+## 限制（平台约束，非代码问题）
 
-在 EdgeOne 控制台「项目设置 → 环境变量」中配置（均为可选）：
+1. **连接时长受限**。单次执行上限 120 秒（已配置）；站点层 WebSocket 空闲超时最长 300 秒。
+   建议客户端心跳间隔设在 60 秒以内。客户端会自动重连。
+2. **只支持 HTTP/1.1 的 WebSocket**，不支持 HTTP/2。
+3. **只能有一个网络**（`VNT_NETWORK` 单值）。
+4. **不含**服务端数据中继、多服务端互联、IKEv2、WireGuard、订阅托管、子网同步。
 
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `VNT_GATEWAY` | `10.26.0.1` | 虚拟网关地址 |
-| `VNT_NETMASK` | `255.255.255.0` | 虚拟子网掩码（决定地址池大小） |
-| `VNT_LEASE_SECONDS` | `604800` | 离线设备地址租期（秒），到期后才回收 |
-| `VNT_NETWORK_WHITELIST` | 空 | **只能填一个** `network_code`。留空表示不限制；填入后必须完全一致才允许接入 |
-
----
-
-## 客户端接入
-
-VNT 2.x 客户端的 WebSocket 地址由 `wss://host:port` 构造，**不带路径**，
-因此服务端 WS 入口挂在站点根路径 `/`。
-
-> ⚠️ **地址必须带端口。** 客户端解析地址时强制要求 `host:port` 形式，
-> 写成 `wss://你的域名` 会直接报
-> `invalid server address "...": address has no port`，
-> 而且**根本不发起连接**（连握手都没有，服务端日志里一片空白）。
-> 必须写成 **`wss://你的域名:443`**。端口用标准 443，EdgeOne 负责 TLS 终结。
-> 尾部的 `/` 也会被当成主机名的一部分，同样报 "has no port"。
-
-```bash
-# 命令行客户端
-vnt -s wss://你的域名:443 \
-    --network-code my-net \
-    --device-id my-pc \
-    --device-mode tun
-```
-
-对应 `config.toml`：
-
-```toml
-server = ["wss://你的域名:443"]
-network_code = "my-net"
-device_id = "my-pc"
-device_mode = "tun"
-```
-
-> 注意：`wss://` 默认走 443，EdgeOne 会自动提供 HTTPS。**不要**写成 `wss://域名:29872`
-> ——那是原生 vnts 的 TLS 端口，EdgeOne 不监听该端口。
-
-### 验证服务是否正常
-
-浏览器打开 `https://你的域名/health`，应返回：
-
-```json
-{
-  "ok": true,
-  "service": "vnts2-edgeone",
-  "protocol": "vnt2",
-  "networks": 1,
-  "connectionsTotal": 2,
-  "uptimeSeconds": 37,
-  "detail": [ { "networkCode": "my-net", "gateway": "10.26.0.1", "devices": [ ... ] } ]
-}
-```
-
-访问 `https://你的域名/` 可看到一个状态页，列出当前实例内的网络与设备。
-
-> `networks` / `connectionsTotal` 都是**当前函数实例**的计数。
-> 多次刷新数字不一致，或者刷新后归零，说明请求落到了不同实例 —— 这是第 10 条限制的
-> 直接体现，不是 bug。**判断服务是否活着只看 `ok: true`**，不要拿设备数当健康指标。
-
----
-
-## 协议实现范围
-
-已实现（对齐 vnts2 `src/server/control_server/handler.rs`）：
-
-- **注册**：普通注册、预注册 + `ConfirmReg`、`FastReg`
-- **虚拟 IP 分配**：按 `device_id` 复用、网段校验、跳过网关/网络号/广播地址、租期回收
-- **节点发现**：`PingTurn`(16B) → `PushClientIps`，支持全量与增量（`data_version`）
-- **数据面**：`Turn` 单播中继、`Broadcast`、`ExcludeBroadcast`、`TargetBroadcast`
-- **打洞信令**：`PunchStart1/2`、`PunchReq/Res` 转发
-- **网关能力**：`PingTurn`→`PongTurn`、`Turn` 中的 ICMP Echo 应答、`RpcReq`→`RpcRes` 客户端列表
-
-未实现：多服务端互联（`ServerMessage`）、`IKEv2`、`WireGuard`、订阅托管（`Subscription*`）、
-子网同步（`SubnetSync*`）、`Application` 通道。
-
-## 扩展：如需跨实例一致
-
-若你的场景必须突破「单实例」限制，最小改动点是 `cloud-functions/_vnt/state.js`：
-
-1. 把 `registry` 的设备表读写改为走共享存储（EdgeOne 的 KV、或任意外部 Redis/Upstash）；
-2. 把 `_relayTo` / `_broadcast` 的「直接 `sender(bytes)`」改为「发布到共享通道 + 各实例订阅投递」。
-
-接口边界已经收敛在 `NetworkState` 与 `Session` 两处，改造不需要触碰协议层。
+当双方都是对称 NAT、打洞失败时，**没有任何兜底**（这是纯打洞模式的代价）。
+如果这种场景常见，建议改用带 Durable Object 的部署形态，或把 `VNT_ALLOW_RELAY=1`
+打开（但跨实例中继因轮询延迟体验不佳，仅在双方恰好同实例时较快）。
 
 ---
 

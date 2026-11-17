@@ -31,14 +31,29 @@ import { registry, resolveConfig } from "../cloud-functions/_vnt/state.js";
 import { Session } from "../cloud-functions/_vnt/server.js";
 
 let passed = 0;
+let failed = 0;
+const pending = [];
+
+/**
+ * 登记一个用例。**支持 async** ——
+ * 早期版本直接调用 fn()，异步用例的 rejection 会逃出 try/catch 变成
+ * 未捕获异常，失败被静默算作通过。这里统一收集后按序 await。
+ */
 function test(name, fn) {
-  try {
-    fn();
-    passed++;
-    console.log(`  ✓ ${name}`);
-  } catch (e) {
-    console.error(`  ✗ ${name}\n    ${e.message}`);
-    process.exitCode = 1;
+  pending.push({ name, fn });
+}
+
+async function runAll() {
+  for (const { name, fn } of pending) {
+    try {
+      await fn();
+      passed++;
+      console.log(`  ✓ ${name}`);
+    } catch (e) {
+      failed++;
+      console.error(`  ✗ ${name}\n    ${e.message}`);
+      process.exitCode = 1;
+    }
   }
 }
 
@@ -390,195 +405,294 @@ test("解析器本身可信：Writer 输出能被 parseAllFields 还原", () => 
   assert.equal(f[1].value, 300);
   assert.equal(u32ToIp(f[2].value), "10.26.0.2");
 });
-
 // ---------------------------------------------------------------------------
-// 5. 网络状态与 IP 分配
+// 5. 设备登记（管理 API 侧）+ 静态 IP 校验
 // ---------------------------------------------------------------------------
-console.log("网络状态");
-test("注册分配 IP 并复用", () => {
-  const net = registry.network("test-net-1", resolveConfig({}));
-  const a = net.registerDevice({ deviceId: "a", clientType: 0, requestedIp: 0, name: "A" });
-  assert.equal(u32ToIp(a.entry.ip), "10.26.0.2");
-  const b = net.registerDevice({ deviceId: "b", clientType: 0, requestedIp: 0, name: "B" });
-  assert.equal(u32ToIp(b.entry.ip), "10.26.0.3");
-  // 同设备重连应复用旧 IP
-  net.offline("a");
-  const a2 = net.registerDevice({ deviceId: "a", clientType: 0, requestedIp: 0, name: "A" });
-  assert.equal(u32ToIp(a2.entry.ip), "10.26.0.2");
-});
-test("拒绝非本网段 IP 并重新分配", () => {
-  const net = registry.network("test-net-2", resolveConfig({}));
-  const r = net.registerDevice({ deviceId: "x", clientType: 0, requestedIp: ipToU32("192.168.5.5"), name: "X" });
-  assert.ok(net.contains(r.entry.ip));
-  assert.equal(u32ToIp(r.entry.ip), "10.26.0.2");
-});
-test("网关地址不会被分配", () => {
-  const net = registry.network("test-net-3", resolveConfig({}));
-  const r = net.registerDevice({ deviceId: "g", clientType: 0, requestedIp: ipToU32("10.26.0.1"), name: "G" });
-  assert.notEqual(u32ToIp(r.entry.ip), "10.26.0.1");
-});
-test("dataVersion 随上下线变化", () => {
-  const net = registry.network("test-net-4", resolveConfig({}));
-  const v0 = net.dataVersion;
-  net.registerDevice({ deviceId: "p", clientType: 0, requestedIp: 0, name: "P" });
-  assert.ok(net.dataVersion > v0);
-  const v1 = net.dataVersion;
-  net.offline("p");
-  assert.ok(net.dataVersion > v1);
-});
+console.log("设备登记");
 
-// ---------------------------------------------------------------------------
-// 6. 端到端：注册 + 双向中继
-// ---------------------------------------------------------------------------
-console.log("端到端");
-test("两个客户端注册后可通过服务端中继互发数据", () => {
-  const env = {};
-  const netCode = "e2e-net";
+/** 每个用例用独立网络，避免互相干扰 */
+let netSeq = 0;
+function freshNet(env = {}) {
+  netSeq += 1;
+  const cfg = resolveConfig({ VNT_NETWORK: `net-${netSeq}`, ...env });
+  return cfg;
+}
 
-  const outA = [];
-  const outB = [];
+test("登记设备后可按登记的 ip 注册", async () => {
+  const cfg = freshNet();
+  const net = registry.network(cfg.networkCode, cfg);
+  const entry = await net.registerEntry({ deviceId: "pc-a", ip: ipToU32("10.26.0.2"), name: "客厅PC" });
+  assert.equal(entry.ok, true);
 
-  const sa = new Session(env);
-  const okA = sa.handleFirstFrame(encodeRegRequestFixture({ networkCode: netCode, deviceId: "A" }), (b) => outA.push(b));
-  assert.equal(okA, true);
-  // 第一帧必须是注册响应；其后可能紧跟一次节点列表推送（注册后主动推送）
-  assert.ok(outA.length >= 1, `至少应有一帧注册响应，实际 ${outA.length}`);
-  assert.equal(outA[0][0] >> 3, 1, "首帧应是 ResponseMessage 的 reg（field 1）");
-
-  const sb = new Session(env);
-  const okB = sb.handleFirstFrame(
-    encodeRegRequestFixture({ networkCode: netCode, deviceId: "B", ip: ipToU32("10.26.0.3") }),
-    (b) => outB.push(b),
-  );
-  assert.equal(okB, true);
-
-  assert.equal(u32ToIp(sa.ip), "10.26.0.2");
-  assert.equal(u32ToIp(sb.ip), "10.26.0.3");
-
-  // A -> B 的 Turn 包
-  const turn = buildPacket({
-    msgType: MsgType.Turn,
-    ttl: 15,
-    seq: 1,
-    src: sa.ip,
-    dest: sb.ip,
-    payload: new Uint8Array([0xde, 0xad]),
-  }).toUint8Array();
-
-  outB.length = 0;
-  sa.handleDataPacket(turn, (b) => outA.push(b));
-  assert.equal(outB.length, 1, "B 应收到 1 个包");
-  const got = outB[0];
-  assert.equal(u32ToIp(parseHeaderFast(got).dest), "10.26.0.3");
-  assert.equal(got[1] & 0x0f, 14, "TTL 应被递减");
-});
-
-test("广播会发给除发送者外的所有在线节点", () => {
-  const env = {};
-  const netCode = "bcast-net";
-  const outA = [];
-  const outB = [];
-  const outC = [];
-  const sa = new Session(env);
-  sa.handleFirstFrame(encodeRegRequestFixture({ networkCode: netCode, deviceId: "A" }), (b) => outA.push(b));
-  const sb = new Session(env);
-  sb.handleFirstFrame(encodeRegRequestFixture({ networkCode: netCode, deviceId: "B", ip: ipToU32("10.26.0.3") }), (b) => outB.push(b));
-  const sc = new Session(env);
-  sc.handleFirstFrame(encodeRegRequestFixture({ networkCode: netCode, deviceId: "C", ip: ipToU32("10.26.0.4") }), (b) => outC.push(b));
-
-  outA.length = 0; outB.length = 0; outC.length = 0;
-  const bcast = buildPacket({
-    msgType: MsgType.Broadcast,
-    ttl: 15,
-    src: sa.ip,
-    dest: 0xffffffff >>> 0,
-    payload: new Uint8Array([1]),
-  }).toUint8Array();
-  sa.handleDataPacket(bcast, () => {});
-  assert.equal(outA.length, 0, "发送者不应收到自己的广播");
-  assert.equal(outB.length, 1);
-  assert.equal(outC.length, 1);
-});
-
-test("PingTurn(16字节) 在版本变化时返回节点列表", () => {
-  const env = {};
-  const netCode = "ping-net";
-  const outA = [];
-  const sa = new Session(env);
-  sa.handleFirstFrame(encodeRegRequestFixture({ networkCode: netCode, deviceId: "A" }), (b) => outA.push(b));
-  const sb = new Session(env);
-  sb.handleFirstFrame(encodeRegRequestFixture({ networkCode: netCode, deviceId: "B", ip: ipToU32("10.26.0.3") }), () => {});
-
-  outA.length = 0;
-  const payload = new Uint8Array(16);
-  new DataView(payload.buffer).setBigInt64(0, BigInt(Date.now()), false);
-  new DataView(payload.buffer).setBigUint64(8, 0n, false); // data_version=0 -> 全量
-  const ping = buildPacket({ msgType: MsgType.PingTurn, ttl: 1, gateway: true, payload }).toUint8Array();
-  sa.handleDataPacket(ping, (b) => outA.push(b));
-
-  assert.equal(outA.length, 1);
-  const resp = outA[0];
-  assert.equal(parseHeaderFast(resp).msgType, MsgType.PushClientIps);
-  // 列表中应含 B
-  const list = resp.subarray(HEAD_LENGTH);
-  const r = new Reader(list);
-  const ips = [];
-  r.each((field, wire, rr) => {
-    if (field === 2 && wire === 2) {
-      const inner = rr.readMessage();
-      let ip = 0;
-      inner.each((f, _w, ss) => {
-        if (f === 1) {
-          ip = ss.readFixed32();
-          return true;
-        }
-        return false;
-      });
-      ips.push(u32ToIp(ip));
-      return true;
-    }
-    return false;
+  const sent = [];
+  const r = await net.registerDevice({
+    deviceId: "pc-a",
+    clientType: 0,
+    requestedIp: ipToU32("10.26.0.2"),
+    send: (b) => sent.push(b),
   });
-  assert.ok(ips.includes("10.26.0.3"), `节点列表应包含 B，实际: ${ips.join(",")}`);
+  assert.equal(r.ok, true);
+  assert.equal(u32ToIp(r.ip), "10.26.0.2");
 });
 
-test("白名单：只放行唯一匹配的 network_code", () => {
-  const env = { VNT_NETWORK_WHITELIST: "allowed-net" };
+test("未登记的设备无法注册", async () => {
+  const cfg = freshNet();
+  const net = registry.network(cfg.networkCode, cfg);
+  const r = await net.registerDevice({
+    deviceId: "stranger",
+    clientType: 0,
+    requestedIp: ipToU32("10.26.0.9"),
+    send: () => {},
+  });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "not_registered");
+});
+
+test("ip 与登记不符时拒绝（防止冒用他人地址）", async () => {
+  const cfg = freshNet();
+  const net = registry.network(cfg.networkCode, cfg);
+  await net.registerEntry({ deviceId: "pc-b", ip: ipToU32("10.26.0.3") });
+  const r = await net.registerDevice({
+    deviceId: "pc-b",
+    clientType: 0,
+    requestedIp: ipToU32("10.26.0.99"),
+    send: () => {},
+  });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "ip_mismatch");
+});
+
+test("同一 ip 不能登记给两台设备", async () => {
+  const cfg = freshNet();
+  const net = registry.network(cfg.networkCode, cfg);
+  assert.equal((await net.registerEntry({ deviceId: "d1", ip: ipToU32("10.26.0.5") })).ok, true);
+  const dup = await net.registerEntry({ deviceId: "d2", ip: ipToU32("10.26.0.5") });
+  assert.equal(dup.ok, false);
+});
+
+test("保留地址（网关/网络号/广播）拒绝登记", async () => {
+  const cfg = freshNet();
+  const net = registry.network(cfg.networkCode, cfg);
+  for (const bad of ["10.26.0.1", "10.26.0.0", "10.26.0.255"]) {
+    const r = await net.registerEntry({ deviceId: `x-${bad}`, ip: ipToU32(bad) });
+    assert.equal(r.ok, false, `${bad} 不应被接受`);
+  }
+});
+
+test("网段外的 ip 拒绝登记", async () => {
+  const cfg = freshNet();
+  const net = registry.network(cfg.networkCode, cfg);
+  const r = await net.registerEntry({ deviceId: "outside", ip: ipToU32("192.168.1.5") });
+  assert.equal(r.ok, false);
+});
+
+test("删除登记后该设备无法再注册", async () => {
+  const cfg = freshNet();
+  const net = registry.network(cfg.networkCode, cfg);
+  await net.registerEntry({ deviceId: "temp", ip: ipToU32("10.26.0.7") });
+  assert.equal(await net.removeEntry("temp"), true);
+  const r = await net.registerDevice({
+    deviceId: "temp",
+    clientType: 0,
+    requestedIp: ipToU32("10.26.0.7"),
+    send: () => {},
+  });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "not_registered");
+});
+
+test("登记的 ip 可以改，改后旧地址失效", async () => {
+  const cfg = freshNet();
+  const net = registry.network(cfg.networkCode, cfg);
+  await net.registerEntry({ deviceId: "m", ip: ipToU32("10.26.0.8") });
+  await net.registerEntry({ deviceId: "m", ip: ipToU32("10.26.0.9") });
+
+  const bad = await net.registerDevice({
+    deviceId: "m", clientType: 0, requestedIp: ipToU32("10.26.0.8"), send: () => {},
+  });
+  assert.equal(bad.ok, false, "旧地址应失效");
+
+  const good = await net.registerDevice({
+    deviceId: "m", clientType: 0, requestedIp: ipToU32("10.26.0.9"), send: () => {},
+  });
+  assert.equal(good.ok, true);
+});
+
+test("未连接的已登记设备显示为离线但 everConnected=false", async () => {
+  const cfg = freshNet();
+  const net = registry.network(cfg.networkCode, cfg);
+  await net.registerEntry({ deviceId: "idle", ip: ipToU32("10.26.0.10"), name: "待机" });
+  const list = await net.listEntries();
+  const one = list.find((d) => d.deviceId === "idle");
+  assert.equal(one.online, false);
+  assert.equal(one.everConnected, false);
+});
+
+// ---------------------------------------------------------------------------
+// 6. 端到端：注册 + 打洞信令转发（不中转业务流量）
+// ---------------------------------------------------------------------------
+console.log("端到端（纯打洞）");
+
+/** 预登记三台设备并把 Session 拉起来 */
+async function setupNet(code, specs) {
+  const cfg = resolveConfig({ VNT_NETWORK: code });
+  const net = registry.network(code, cfg);
+  for (const s of specs) {
+    await net.registerEntry({ deviceId: s.id, ip: ipToU32(s.ip), name: s.name || s.id });
+  }
+  return { cfg, net };
+}
+
+function regFrameFor({ networkCode, deviceId, ip, name = "pc" }) {
+  return encodeRegRequestFixture({ networkCode, deviceId, ip, name });
+}
+
+test("登记设备注册成功，且注册响应里 server_instance_id 恰好 32 字节", async () => {
+  const code = "e2e-reg";
+  await setupNet(code, [{ id: "A", ip: "10.26.0.2" }]);
   const out = [];
-
-  // 不匹配 -> 拒绝
-  const s1 = new Session(env);
-  assert.equal(s1.handleFirstFrame(encodeRegRequestFixture({ networkCode: "other-net", deviceId: "A" }), (b) => out.push(b)), false);
-  assert.equal(out.length, 1);
-
-  // 完全一致 -> 放行
-  const s2 = new Session(env);
-  assert.equal(s2.handleFirstFrame(encodeRegRequestFixture({ networkCode: "allowed-net", deviceId: "B" }), () => {}), true);
+  const sa = new Session({ VNT_NETWORK: code });
+  const ok = await sa.handleFirstFrame(
+    regFrameFor({ networkCode: code, deviceId: "A", ip: ipToU32("10.26.0.2") }),
+    (b) => out.push(b),
+  );
+  assert.equal(ok, true);
+  assert.ok(out.length >= 1);
+  // 解出 RegResponseMsg 的 field 8 必须是 32 字节（客户端硬校验）
+  const bytes = out[0];
+  const fields = parseAllFields(bytes);
+  const reg = fields.find((f) => f.field === 1 && f.value instanceof Uint8Array);
+  assert.ok(reg, "应有 reg 字段");
+  const innerFields = parseAllFields(reg.value);
+  const sid = innerFields.find((f) => f.field === 8 && f.value instanceof Uint8Array);
+  assert.ok(sid, `应有 server_instance_id，实际字段: ${innerFields.map((f) => f.field).join(",")}`);
+  assert.equal(sid.value.length, 32, "server_instance_id 必须恰好 32 字节");
 });
 
-test("白名单：不支持逗号分隔的多值（多值视为整体，一律拒绝）", () => {
-  const env = { VNT_NETWORK_WHITELIST: "net1,net2" };
-  const s1 = new Session(env);
-  assert.equal(s1.handleFirstFrame(encodeRegRequestFixture({ networkCode: "net1", deviceId: "A" }), () => {}), false);
-  const s2 = new Session(env);
-  assert.equal(s2.handleFirstFrame(encodeRegRequestFixture({ networkCode: "net2", deviceId: "B" }), () => {}), false);
-});
-
-test("白名单：留空表示不限制", () => {
-  const env = { VNT_NETWORK_WHITELIST: "   " };
-  const s = new Session(env);
-  assert.equal(s.handleFirstFrame(encodeRegRequestFixture({ networkCode: "any-net", deviceId: "A" }), () => {}), true);
-});
-
-test("错误：非 VNT 客户端类型被拒绝", () => {
-  const env = {};
+test("未登记设备被拒绝，且错误信息提示先登记", async () => {
+  const code = "e2e-deny";
+  await setupNet(code, []);
   const out = [];
-  const s = new Session(env);
-  const ok = s.handleFirstFrame(
-    encodeRegRequestFixture({ networkCode: "n", deviceId: "A", clientType: ClientType.WIREGUARD }),
+  const s = new Session({ VNT_NETWORK: code });
+  const ok = await s.handleFirstFrame(
+    regFrameFor({ networkCode: code, deviceId: "nobody", ip: ipToU32("10.26.0.2") }),
+    (b) => out.push(b),
+  );
+  assert.equal(ok, false);
+  const text = new TextDecoder().decode(out[0]);
+  assert.ok(text.includes("未登记"), `错误信息应提到未登记，实际: ${text}`);
+});
+
+test("网络编号与服务端环境变量不一致时拒绝", async () => {
+  const code = "e2e-netid";
+  await setupNet(code, [{ id: "A", ip: "10.26.0.2" }]);
+  const out = [];
+  const s = new Session({ VNT_NETWORK: code });
+  const ok = await s.handleFirstFrame(
+    regFrameFor({ networkCode: "wrong-net", deviceId: "A", ip: ipToU32("10.26.0.2") }),
     (b) => out.push(b),
   );
   assert.equal(ok, false);
 });
 
-console.log(`\n通过 ${passed} 项测试`);
+test("打洞信令被转发给目标设备（本实例内直发）", async () => {
+  const code = "e2e-punch";
+  await setupNet(code, [
+    { id: "A", ip: "10.26.0.2" },
+    { id: "B", ip: "10.26.0.3" },
+  ]);
+  const outA = [];
+  const outB = [];
+  const sa = new Session({ VNT_NETWORK: code });
+  await sa.handleFirstFrame(regFrameFor({ networkCode: code, deviceId: "A", ip: ipToU32("10.26.0.2") }), (b) => outA.push(b));
+  const sb = new Session({ VNT_NETWORK: code });
+  await sb.handleFirstFrame(regFrameFor({ networkCode: code, deviceId: "B", ip: ipToU32("10.26.0.3") }), (b) => outB.push(b));
+
+  outB.length = 0;
+  const punch = buildPacket({
+    msgType: MsgType.PunchStart1,
+    ttl: 2,
+    src: sa.ip,
+    dest: sb.ip,
+    payload: new Uint8Array([1, 2, 3, 4]),
+  }).toUint8Array();
+  await sa.handleDataPacket(punch, () => {});
+
+  assert.equal(outB.length, 1, "B 应收到打洞信令");
+  assert.equal(parseHeaderFast(outB[0]).msgType, MsgType.PunchStart1);
+  assert.equal(outB[0][1] & 0x0f, 1, "TTL 应被递减（2 -> 1）");
+});
+
+test("业务流量默认不中转（纯打洞模式）", async () => {
+  const code = "e2e-norelay";
+  await setupNet(code, [
+    { id: "A", ip: "10.26.0.2" },
+    { id: "B", ip: "10.26.0.3" },
+  ]);
+  const outA = [];
+  const outB = [];
+  const sa = new Session({ VNT_NETWORK: code });
+  await sa.handleFirstFrame(regFrameFor({ networkCode: code, deviceId: "A", ip: ipToU32("10.26.0.2") }), (b) => outA.push(b));
+  const sb = new Session({ VNT_NETWORK: code });
+  await sb.handleFirstFrame(regFrameFor({ networkCode: code, deviceId: "B", ip: ipToU32("10.26.0.3") }), (b) => outB.push(b));
+
+  outB.length = 0;
+  const turn = buildPacket({
+    msgType: MsgType.Turn, ttl: 15, src: sa.ip, dest: sb.ip, payload: new Uint8Array([0xde, 0xad]),
+  }).toUint8Array();
+  await sa.handleDataPacket(turn, () => {});
+  assert.equal(outB.length, 0, "Turn 业务流量不应被中转");
+});
+
+test("注册后主动推送全量邻居列表（is_all=true）", async () => {
+  const code = "e2e-push";
+  await setupNet(code, [
+    { id: "A", ip: "10.26.0.2" },
+    { id: "B", ip: "10.26.0.3" },
+  ]);
+  const outA = [];
+  const sa = new Session({ VNT_NETWORK: code });
+  await sa.handleFirstFrame(regFrameFor({ networkCode: code, deviceId: "A", ip: ipToU32("10.26.0.2") }), (b) => outA.push(b));
+
+  const outB = [];
+  const sb = new Session({ VNT_NETWORK: code });
+  await sb.handleFirstFrame(regFrameFor({ networkCode: code, deviceId: "B", ip: ipToU32("10.26.0.3") }), (b) => outB.push(b));
+
+  // A 应收到 B 上线的推送（无需等心跳）
+  const push = outA.find((f) => (f[0] & 0x7f) === MsgType.PushClientIps);
+  assert.ok(push, "A 应收到节点列表推送");
+  const list = decodeClientSimpleInfoList(list_of(push));
+  assert.equal(list.isAll, true, "必须是全量（is_all=true）");
+  assert.ok(list.ips.includes("10.26.0.3"), `列表应包含 B，实际 ${list.ips.join(",")}`);
+});
+
+/** 从 PushClientIps 帧里取出 payload */
+function list_of(frame) {
+  return frame.subarray(HEAD_LENGTH);
+}
+
+/** 解 ClientSimpleInfoList：返回 { isAll, ips } */
+function decodeClientSimpleInfoList(payload) {
+  const r = new Reader(payload);
+  const out = { isAll: false, ips: [], dataVersion: 0 };
+  r.each((field, wire, rr) => {
+    if (field === 1) { out.dataVersion = rr.readVarint(); return true; }
+    if (field === 3) { out.isAll = rr.readVarint() !== 0; return true; }
+    if (field === 4) { rr.readVarint(); return true; }
+    if (field === 2 && wire === 2) {
+      const inner = rr.readMessage();
+      let ip = 0;
+      inner.each((f, _w, ss) => {
+        if (f === 1) { ip = ss.readFixed32(); return true; }
+        return false;
+      });
+      out.ips.push(u32ToIp(ip));
+      return true;
+    }
+    return false;
+  });
+  return out;
+}
+
+await runAll();
+console.log(`\n通过 ${passed} 项测试${failed ? `，失败 ${failed} 项` : ""}`);

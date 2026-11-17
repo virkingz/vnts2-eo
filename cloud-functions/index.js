@@ -19,8 +19,9 @@
 // 非 upgrade 的 GET / 返回状态页，`/health` 返回 JSON 健康检查。
 
 import { Session } from "./_vnt/server.js";
-import { registry } from "./_vnt/state.js";
+import { registry, resolveConfig } from "./_vnt/state.js";
 import { decodeRequestMessage } from "./_vnt/control-messages.js";
+import { handleAdmin } from "./_vnt/admin.js";
 
 /** 把一帧数据统一成 Uint8Array */
 function normalize(message) {
@@ -79,28 +80,46 @@ function createConnection(socket, env) {
     }
   };
 
+  /**
+   * 处理一帧。
+   *
+   * 注册与心跳都要读写共享存储（Blob），所以是异步的。
+   * 帧之间**必须串行**：客户端可能在注册响应到达前就发出下一帧，
+   * 并发处理会让「首帧注册」与「数据帧」乱序，导致未注册就丢包。
+   */
+  let chain = Promise.resolve();
   const feed = (raw) => {
     const bytes = normalize(raw);
     if (!bytes || bytes.length === 0) return;
-    try {
-      if (!session.registered) {
-        // 首帧：裸 protobuf RequestMessage
-        session.handleFirstFrame(bytes, send);
-        return;
-      }
-      if (session.pendingConfirm) {
-        // 预注册第二阶段：等待 ConfirmReg
-        const { kind } = safeDecodeRequest(bytes);
-        if (kind === "confirm_reg") session.handleConfirm(send);
-        return;
-      }
-      session.handleDataPacket(bytes, send);
-    } catch {
-      // 单帧异常不应断开连接；交由上层超时/心跳回收
-    }
+    chain = chain
+      .then(async () => {
+        if (!session.registered) {
+          // 首帧：裸 protobuf RequestMessage
+          await session.handleFirstFrame(bytes, send);
+          return;
+        }
+        if (session.pendingConfirm) {
+          // 预注册第二阶段：等待 ConfirmReg
+          const { kind } = safeDecodeRequest(bytes);
+          if (kind === "confirm_reg") session.handleConfirm(send);
+          return;
+        }
+        await session.handleDataPacket(bytes, send);
+      })
+      .catch(() => {
+        // 单帧异常不应断开连接；交由上层超时/心跳回收
+      });
   };
 
-  return { session, send, feed };
+  /** 连接结束：等排队的帧处理完，再标记离线并通知对端 */
+  const close = () =>
+    chain
+      .then(() => session.onClose())
+      .catch(() => {
+        /* 忽略 */
+      });
+
+  return { session, send, feed, close };
 }
 
 /** 尽可能广泛地兼容不同运行时的 socket 事件绑定方式 */
@@ -170,8 +189,12 @@ function bindSocket(socket, env) {
   if (!conn) return;
 
   on(socket, "message", (event) => conn.feed(eventData(event)));
-  on(socket, "close", () => conn.session.onClose());
-  on(socket, "error", () => conn.session.onClose());
+  on(socket, "close", () => {
+    void conn.close();
+  });
+  on(socket, "error", () => {
+    void conn.close();
+  });
 }
 
 export const onRequest = async (context) => {
@@ -183,39 +206,58 @@ export const onRequest = async (context) => {
     return { websocket: legacyHandler(env) };
   }
 
+  // 管理接口（设备登记）优先于状态页
+  const adminResp = await handleAdmin(request, env);
+  if (adminResp) return adminResp;
+
   const url = new URL(request.url);
   if (url.pathname === "/health" || url.pathname === "/healthz") {
+    const cfg = resolveConfig(env);
+    const net = cfg.networkCode ? registry.find(cfg.networkCode) : null;
     const nets = [];
-    for (const net of registry.networks.values()) nets.push(net.toJSON());
+    for (const n of registry.networks.values()) nets.push(n.toJSON());
     return Response.json({
       ok: true,
       service: "vnts2-edgeone",
       protocol: "vnt2",
+      mode: "p2p-punch-only",
       wsMode: typeof WebSocketPair !== "undefined" ? "websocket-pair" : "callback-object",
-      networks: registry.networks.size,
+      network: cfg.networkCode || null,
+      registeredDevices: net ? net.shared.size : 0,
+      onlineDevices: net ? net.count().online : 0,
       connectionsTotal: registry.stats.connectionsTotal,
-      bytesRelayed: registry.stats.bytesRelayed,
+      bytesSignaled: registry.stats.bytesSignaled,
       uptimeSeconds: Math.floor((Date.now() - registry.startedAt) / 1000),
       detail: nets,
     });
   }
 
-  return new Response(statusHtml(), {
+  return new Response(statusHtml(env), {
     status: 200,
     headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
   });
 };
 
-function statusHtml() {
-  const nets = [];
-  for (const net of registry.networks.values()) nets.push(net.toJSON());
-  const body = JSON.stringify({ networks: nets, stats: registry.stats }, null, 2);
+function statusHtml(env) {
+  const cfg = resolveConfig(env);
+  const net = cfg.networkCode ? registry.find(cfg.networkCode) : null;
+  const devices = net ? net.toJSON().devices : [];
+  const body = JSON.stringify(
+    {
+      networkCode: cfg.networkCode || "(未配置 VNT_NETWORK)",
+      gateway: net ? u32Fallback(net.gateway) : "-",
+      devices,
+      stats: registry.stats,
+    },
+    null,
+    2,
+  );
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vnts2 · EdgeOne</title>
+<title>vnts2 · EdgeOne · P2P</title>
 <style>
   :root { color-scheme: light; }
   body { margin:0; padding:32px; font:14px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif; background:#f7f8fa; color:#1f2328; }
@@ -224,19 +266,32 @@ function statusHtml() {
   code { background:#eef1f4; padding:2px 6px; border-radius:4px; }
   pre { background:#0d1117; color:#e6edf3; padding:16px; border-radius:8px; overflow:auto; font-size:12px; }
   .card { background:#fff; border:1px solid #d8dee4; border-radius:8px; padding:16px 20px; margin-bottom:16px; }
+  .warn { background:#fff8e5; border-color:#e6d9a8; }
 </style>
 </head>
 <body>
   <h1>vnts2 · EdgeOne</h1>
-  <div class="sub">VNT 2.x 服务端（WebSocket 中继）。客户端连接：<code>server = ["wss://你的域名:443"]</code></div>
+  <div class="sub">VNT 2.x 服务端 —— <b>纯 P2P 打洞辅助</b>，不中转数据</div>
   <div class="card">
-    <div>健康检查：<code>GET /health</code></div>
-    <div>当前实例网络数：<b>${registry.networks.size}</b>，累计连接：<b>${registry.stats.connectionsTotal}</b></div>
-    <div style="color:#656d76;margin-top:8px">注意：EdgeOne 无全局单例原语，不同实例各自维护房间表；本页只反映当前实例。</div>
+    <div>客户端连接：<code>server = ["wss://你的域名:443"]</code></div>
+    <div>网络编号：<code>${cfg.networkCode || "未配置 VNT_NETWORK"}</code>（仅来自环境变量）</div>
+    <div>已登记设备：<b>${devices.length}</b>　在线：<b>${net ? net.count().online : 0}</b></div>
+    <div>健康检查：<code>GET /health</code>　设备登记：<code>/admin</code></div>
+  </div>
+  ${cfg.networkCode ? "" : '<div class="card warn">尚未配置 <code>VNT_NETWORK</code>，客户端无法注册。</div>'}
+  <div class="card" style="color:#656d76">
+    不同实例各自维护连接视图，本页只反映当前实例；设备表与打洞信令经 Blob 共享，
+    因此设备可见性不受影响。
   </div>
   <pre>${escapeHtml(body)}</pre>
 </body>
 </html>`;
+}
+
+/** 仅用于状态页展示，避免为了格式化再引一次模块 */
+function u32Fallback(v) {
+  const n = Number(v) >>> 0;
+  return `${(n >>> 24) & 255}.${(n >>> 16) & 255}.${(n >>> 8) & 255}.${n & 255}`;
 }
 
 function escapeHtml(s) {
