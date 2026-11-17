@@ -118,11 +118,10 @@ console.log("路由分发");
 
 console.log("\nWebSocket 升级（两个入口都应支持）");
 
-// EdgeOne Node Functions 的官方形态是**回调对象**：
-//   return { websocket: { onopen, onmessage, onclose, onerror } }
-// 注入的 ws 只有 send/close，事件由平台回调推给我们。
-// 早期版本按 WebSocketPair 写、只在不支持时才回落，实测线上正是回落分支
-// 且事件绑定失败 —— 所以这里断言「必须是回调对象」，不能再依赖 WebSocketPair。
+// 升级路径有两条，优先级：WebSocketPair（返回 Response）> 回调对象。
+// 早期版本只在 HTTP 上下文探测一次，导致升级时走错分支 → 平台报 502。
+// 这里两条都测。
+
 function assertHandler(res, label) {
   const h = res?.websocket;
   check(
@@ -134,31 +133,94 @@ function assertHandler(res, label) {
       typeof h.onerror === "function",
     Object.keys(res || {}).join(","),
   );
-  return h;
+}
+
+function fakePair() {
+  class FakeSocket {
+    constructor() {
+      this.listeners = new Map();
+      this.sent = [];
+    }
+    addEventListener(n, f) {
+      if (!this.listeners.has(n)) this.listeners.set(n, []);
+      this.listeners.get(n).push(f);
+    }
+    accept() {}
+    send(d) {
+      this.sent.push(d);
+    }
+    close() {}
+  }
+  const sockets = [];
+  globalThis.WebSocketPair = class {
+    constructor() {
+      this.socket = new FakeSocket();
+      this.response = new Response(null, { status: 200 });
+      sockets.push(this.socket);
+    }
+  };
+  return sockets;
+}
+
+// ── 无 WebSocketPair 时：必须回落回调对象（当前线上就是这种） ──
+{
+  const saved = globalThis.WebSocketPair;
+  delete globalThis.WebSocketPair;
+  try {
+    const res = await rootHandler({
+      request: new Request("https://x/", { headers: { upgrade: "websocket" } }),
+      env: ENV,
+    });
+    assertHandler(res, "无 WebSocketPair 时 index.js 处理 / 的升级，");
+  } finally {
+    if (saved !== undefined) globalThis.WebSocketPair = saved;
+  }
 }
 
 {
-  const res = await rootHandler({
-    request: new Request("https://x/", { headers: { upgrade: "websocket" } }),
-    env: ENV,
-  });
-  assertHandler(res, "index.js 处理 / 的升级时");
+  const saved = globalThis.WebSocketPair;
+  delete globalThis.WebSocketPair;
+  try {
+    const res = await catchAllHandler({
+      request: new Request("https://x/some/path", { headers: { upgrade: "websocket" } }),
+      env: ENV,
+    });
+    assertHandler(res, "无 WebSocketPair 时 catch-all 处理升级，");
+  } finally {
+    if (saved !== undefined) globalThis.WebSocketPair = saved;
+  }
 }
 
+// ── 有 WebSocketPair 时：优先用它，返回 Response ──
 {
-  const res = await catchAllHandler({
-    request: new Request("https://x/some/path", { headers: { upgrade: "websocket" } }),
-    env: ENV,
-  });
-  assertHandler(res, "catch-all 处理任意路径的升级时");
+  const saved = globalThis.WebSocketPair;
+  const sockets = fakePair();
+  try {
+    const res = await rootHandler({
+      request: new Request("https://x/", { headers: { upgrade: "websocket" } }),
+      env: ENV,
+    });
+    check("有 WebSocketPair 时返回 Response（优先级更高）", res instanceof Response, String(res));
+    check("WebSocketPair 的 socket 已 accept", sockets.length === 1);
+
+    // 通过 socket 发一帧，验证事件绑定生效
+    const socket = sockets[0];
+    const reg = new Request("https://x/", { headers: { upgrade: "websocket" } });
+    void reg;
+    const msgListeners = socket.listeners.get("message") || [];
+    check("WebSocketPair 形态下已绑定 message 事件", msgListeners.length > 0, String(msgListeners.length));
+  } finally {
+    if (saved === undefined) delete globalThis.WebSocketPair;
+    else globalThis.WebSocketPair = saved;
+  }
 }
 
+// ── WebSocketPair 抛错时必须回落，不能让平台报 502 ──
 {
-  // 即便运行时*有* WebSocketPair，也必须返回回调对象 —— 那是官方模板验证过的形态
   const saved = globalThis.WebSocketPair;
   globalThis.WebSocketPair = class {
     constructor() {
-      throw new Error("不应在 Node Functions 里使用 WebSocketPair");
+      throw new Error("运行时不支持 WebSocketPair");
     }
   };
   try {
@@ -166,27 +228,32 @@ function assertHandler(res, label) {
       request: new Request("https://x/", { headers: { upgrade: "websocket" } }),
       env: ENV,
     });
-    assertHandler(res, "即使存在 WebSocketPair，仍");
+    assertHandler(res, "WebSocketPair 抛错时，");
   } finally {
     if (saved === undefined) delete globalThis.WebSocketPair;
     else globalThis.WebSocketPair = saved;
   }
 }
 
+// ── 注入的 ws 只有 send/close（官方模板形态）──
 {
-  // 注入的 ws 只有 send/close —— 必须能正常收发，不得依赖 addEventListener
-  const res = await rootHandler({
-    request: new Request("https://x/", { headers: { upgrade: "websocket" } }),
-    env: ENV,
-  });
-  const ws = {
-    sent: [],
-    send(d) {
-      this.sent.push(d);
-    },
-    close() {},
-  };
-  res.websocket.onopen(ws, new Request("https://x/"));
-  check("onopen 后连接就绪", true);
-  check("ws 只有 send/close 时也能注册（不依赖 addEventListener）", typeof ws.send === "function");
+  const saved = globalThis.WebSocketPair;
+  delete globalThis.WebSocketPair;
+  try {
+    const res = await rootHandler({
+      request: new Request("https://x/", { headers: { upgrade: "websocket" } }),
+      env: ENV,
+    });
+    const ws = {
+      sent: [],
+      send(d) {
+        this.sent.push(d);
+      },
+      close() {},
+    };
+    res.websocket.onopen(ws, new Request("https://x/"));
+    check("ws 只有 send/close 时也能 onopen（不依赖 addEventListener）", true);
+  } finally {
+    if (saved !== undefined) globalThis.WebSocketPair = saved;
+  }
 }

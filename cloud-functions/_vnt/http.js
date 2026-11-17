@@ -90,6 +90,12 @@ export async function healthResponse(env) {
       "存储降级为内存，跨实例共享失效。请确认 package.json 里有 @edgeone/pages-blob 依赖，且构建时执行了 npm install。";
   }
 
+  // 诊断用：仅在与 WebSocket 相关的地方出错才会有值。
+  // 只放错误摘要，不含网络编号、设备等信息。
+  if (registry.stats.lastError) {
+    body.lastError = registry.stats.lastError;
+  }
+
   return Response.json(body, { headers: { "cache-control": "no-store" } });
 }
 

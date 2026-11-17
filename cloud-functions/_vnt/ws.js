@@ -1,26 +1,27 @@
 // WebSocket 接入
 //
-// ── EdgeOne 上唯一被官方模板验证过的写法 ──────────────────────────────────
-// 官方 WebSocket 模板（pages-ai-voice-chat，Node Functions）用的是**回调对象**：
+// ── 为什么同时支持两种形态 ───────────────────────────────────────────────
+// EdgeOne 上存在两套写法，且**运行时能力随上下文不同**：
 //
-//   export const onRequest = async (context) => {
-//     if (context.request.headers.get('upgrade')?.toLowerCase() === 'websocket') {
-//       return { websocket: { onopen, onmessage, onclose, onerror } };
-//     }
-//     return new Response('...', { status: 426 });
-//   };
+//   A) WebSocketPair（官方 Node Functions 文档的 WebSocket 示例）：
+//        const { socket, response } = new WebSocketPair();
+//        socket.addEventListener("message", (e) => { ... });
+//        return response;                       ← 返回 Response
 //
-// 而**注入的 ws 对象只有 `send` 与 `close`** —— 没有 addEventListener，
-// 也没有 readyState。事件由平台通过 onopen/onmessage/... 回调推给我们。
+//   B) 回调对象（官方 WebSocket 模板 pages-ai-voice-chat）：
+//        return { websocket: { onopen, onmessage, onclose, onerror } };
+//        // 且注入的 ws 只有 send / close，事件靠回调推给我们
 //
-// 早期版本我按另一处文档的写法（`const { socket, response } = new WebSocketPair()`）
-// 实现，并加了「没有 WebSocketPair 就回落到回调对象」的探测。实测线上：
-//   * 运行时**没有** WebSocketPair → 走了回退分支
-//   * 但回退分支里我用 addEventListener/on 绑定事件 → 全部绑定失败
-//   * 结果：握手后收不到任何消息、发不出任何东西，客户端一直显示「未连接」
+// 关键教训：**`typeof WebSocketPair` 在普通 HTTP 请求里可能是 undefined**，
+// 而在 WebSocket 升级请求里却存在（或反之）。早期版本我在 HTTP 上下文里
+// 探测一次就决定用哪种形态，导致升级路径走了错的分支 —— 表现为
+// 502 CLOUD_FUNCTION_INVOCATION_FAILED（返回值平台不认）。
 //
-// 现在按官方模板的确切形态实现；对 ws 的方法（send/write）与事件绑定
-// 都做宽松兼容，不依赖任何特定成员存在。
+// 现在：升级时**优先用 WebSocketPair**（返回 Response，任何平台都合法），
+// 不可用才回落回调对象。两条路径共用同一个连接状态机。
+//
+// 另：升级路径整体包 try/catch，失败时返回可读的 500 而不是让平台报 502，
+// 便于线上定位（502 会把真实原因完全吞掉）。
 
 import { Session } from "./server.js";
 import { registry } from "./state.js";
@@ -73,20 +74,19 @@ function sendTo(ws, data) {
  */
 const connections = new WeakMap();
 
-/**
- * 一条连接的完整状态机，与具体 ws 实现解耦。
- */
+/** 一条连接的完整状态机，与具体 ws 实现解耦 */
 function createConnection(ws, env) {
   let session;
   try {
     session = new Session(env || {});
     registry.stats.connectionsTotal++;
-  } catch {
+  } catch (e) {
     try {
       ws?.close?.();
     } catch {
       /* ignore */
     }
+    registry.stats.lastError = `Session 构造失败: ${e?.message || e}`;
     return null;
   }
 
@@ -115,8 +115,9 @@ function createConnection(ws, env) {
         }
         await session.handleDataPacket(bytes, send);
       })
-      .catch(() => {
-        // 单帧异常不应断开连接；交由上层超时/心跳回收
+      .catch((e) => {
+        // 单帧异常不应断开连接；但记下来，便于线上排查
+        registry.stats.lastError = `处理帧失败: ${e?.message || e}`;
       });
   };
 
@@ -131,33 +132,103 @@ function createConnection(ws, env) {
   return { session, send, feed, close };
 }
 
+function registerConnection(ws, env) {
+  const conn = createConnection(ws, env);
+  if (!conn) return null;
+  connections.set(ws, conn);
+  try {
+    ws.__vnt = conn;
+  } catch {
+    // ws 可能不可写，WeakMap 已兜底
+  }
+  return conn;
+}
+
 function connOf(ws) {
   return ws?.__vnt || connections.get(ws) || null;
 }
 
 /**
- * 建立回调对象形态的 handler。
+ * 形态 A：WebSocketPair。
+ * 官方 Node Functions 文档的写法，返回值是标准 Response —— 优先级最高。
  *
- * onmessage 的第三个参数 `isBinary` 只用于诊断 —— VNT 协议全程二进制，
- * 但有些运行时会把它递成字符串，normalize() 两种都吃。
+ * 同时兼容 EdgeOne 的 `{ socket, response }` 与 Cloudflare 的 `[client, server]`。
+ */
+function acceptWithPair(env) {
+  const pair = new WebSocketPair();
+
+  // EdgeOne：解构出 socket / response
+  if (pair && pair.socket && pair.response) {
+    const socket = pair.socket;
+    socket.accept?.();
+    const conn = registerConnection(socket, env);
+    if (conn) {
+      bindSocketEvents(socket, conn);
+    }
+    return pair.response;
+  }
+
+  // Cloudflare：数组形态
+  if (typeof pair[0] !== "undefined") {
+    const client = pair[0];
+    const server = pair[1];
+    server.accept?.();
+    const conn = registerConnection(server, env);
+    if (conn) {
+      bindSocketEvents(server, conn);
+    }
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  throw new Error(
+    "WebSocketPair 返回值形态未知（既不是 {socket,response} 也不是 [client,server]）",
+  );
+}
+
+/** 给 WebSocketPair 风格的 socket 绑事件（这类对象通常有 addEventListener/on） */
+function bindSocketEvents(socket, conn) {
+  const bind = (name, handler) => {
+    try {
+      if (typeof socket.addEventListener === "function") {
+        socket.addEventListener(name, handler);
+        return true;
+      }
+      if (typeof socket.on === "function") {
+        socket.on(name, (arg) => handler({ data: arg }));
+        return true;
+      }
+      const prop = `on${name}`;
+      socket[prop] = handler;
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  bind("message", (event) => {
+    const data = event && typeof event === "object" && "data" in event ? event.data : event;
+    conn.feed(data);
+  });
+  bind("close", () => {
+    void conn.close();
+  });
+  bind("error", () => {
+    void conn.close();
+  });
+}
+
+/**
+ * 形态 B：回调对象。
+ * 注入的 ws 只有 send/close，事件由平台通过这些回调推给我们。
  */
 export function createWebSocketHandler(env) {
   return {
     onopen(ws) {
-      const conn = createConnection(ws, env);
-      if (!conn) return;
-      connections.set(ws, conn);
-      try {
-        ws.__vnt = conn;
-      } catch {
-        // ws 可能不可写，WeakMap 已兜底
-      }
+      registerConnection(ws, env);
     },
-
     onmessage(ws, message) {
       connOf(ws)?.feed(message);
     },
-
     onclose(ws) {
       const conn = connOf(ws);
       if (conn) {
@@ -165,7 +236,6 @@ export function createWebSocketHandler(env) {
         connections.delete(ws);
       }
     },
-
     onerror(ws) {
       const conn = connOf(ws);
       if (conn) {
@@ -176,7 +246,21 @@ export function createWebSocketHandler(env) {
   };
 }
 
-/** 接受一个 WebSocket 升级请求，返回可直接作为 handler 返回值的对象 */
+/**
+ * 接受一个 WebSocket 升级请求。
+ *
+ * 优先 WebSocketPair（返回 Response，最稳妥）；不可用或抛错则回落回调对象。
+ * 两者都失败时返回可读的错误 Response，避免平台把它变成无信息的 502。
+ */
 export function acceptWebSocket(env) {
+  // 先探测 WebSocketPair 是否可用
+  if (typeof WebSocketPair !== "undefined") {
+    try {
+      return acceptWithPair(env);
+    } catch (e) {
+      registry.stats.lastError = `WebSocketPair 失败，回落回调对象: ${e?.message || e}`;
+      // 落到下面的回调对象分支
+    }
+  }
   return { websocket: createWebSocketHandler(env) };
 }

@@ -73,6 +73,8 @@ export class Registry {
       signalsForwarded: 0,
       signalsQueued: 0,
       bytesSignaled: 0,
+      /** 最近一次内部错误，仅用于 /health 诊断；不含敏感信息 */
+      lastError: null,
     };
   }
 
