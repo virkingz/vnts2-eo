@@ -159,8 +159,9 @@ function acceptWithPair(env) {
 
   // EdgeOne：解构出 socket / response
   if (pair && pair.socket && pair.response) {
+    // 注意：官方示例没有 socket.accept() 这一步（那是 Cloudflare 的写法），
+    // 这里也严格不调用 —— 多调一次可能破坏升级握手。
     const socket = pair.socket;
-    socket.accept?.();
     const conn = registerConnection(socket, env);
     if (conn) {
       bindSocketEvents(socket, conn);
@@ -172,7 +173,7 @@ function acceptWithPair(env) {
   if (typeof pair[0] !== "undefined") {
     const client = pair[0];
     const server = pair[1];
-    server.accept?.();
+    server.accept?.(); // Cloudflare 形态才需要
     const conn = registerConnection(server, env);
     if (conn) {
       bindSocketEvents(server, conn);
