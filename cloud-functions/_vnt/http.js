@@ -7,16 +7,28 @@
 // 本项目把这些非 WS 的路由集中在这里，由 catch-all 入口
 // （cloud-functions/[[default]].js）与 index.js 共用同一份逻辑，
 // 避免两处各写一遍而长歪。
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// 公开面最小化原则
+// ═══════════════════════════════════════════════════════════════════════════
+// 本服务端有一个**完全公开**的探针端点 /health 和一个根路径状态页。
+// 它们绝不能暴露任何可用于接入或侦察的信息：
+//
+//   ❌ network_code —— 这是接入凭据。虽然注册还需要已登记的设备，
+//                      但泄露网络编号等于交出一半钥匙，也会告诉别人
+//                      "这里有个 VNT 服务端"。
+//   ❌ deviceId / ip / name —— 设备清单，等于内网拓扑 + 设备命名习惯。
+//   ❌ gateway / netmask / 设备数量 —— 网络规模与结构。
+//
+// 因此：
+//   * /health     只回答"活着吗、能不能用"，不含任何配置值
+//   * /           只给一句说明，不渲染设备列表
+//   * 详情（设备表、网络编号等）一律走 /admin/*，需 Bearer 令牌
+// ═══════════════════════════════════════════════════════════════════════════
 
 import { registry, resolveConfig } from "./state.js";
 import { handleAdmin } from "./admin.js";
 import { getBackend } from "./shared-store.js";
-
-/** 仅用于状态页展示，避免为了格式化再引一次模块 */
-function ipOf(v) {
-  const n = Number(v) >>> 0;
-  return `${(n >>> 24) & 255}.${(n >>> 16) & 255}.${(n >>> 8) & 255}.${n & 255}`;
-}
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -27,7 +39,7 @@ function escapeHtml(s) {
  * 返回 Response；调用方负责在拿到 null 时继续走自己的兜底逻辑。
  */
 export async function handleHttp(request, env) {
-  // 管理接口（设备登记）优先
+  // 管理接口（设备登记 + 详情）优先，且它是唯一需要鉴权的入口
   const adminResp = await handleAdmin(request, env);
   if (adminResp) return adminResp;
 
@@ -36,95 +48,85 @@ export async function handleHttp(request, env) {
     return healthResponse(env);
   }
 
-  return new Response(statusHtml(env), {
+  return new Response(statusHtml(), {
     status: 200,
     headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
   });
 }
 
+/**
+ * 健康探针。**公开**，因此只返回非敏感信息。
+ *
+ * 保留这几项是为了让部署者能自助排查（尤其是 storage 降级那条，
+ * 失败时没有任何报错，最难发现）。它们都不构成敏感信息：
+ *   ok / service / protocol —— 服务身份
+ *   mode                    —— 固定值，说明定位
+ *   storage / storageOk     —— Blob 是否真的生效
+ *   configured              —— 布尔值，只回答"配没配"，不给值
+ *
+ * 刻意**不**返回：network_code、gateway、netmask、deviceId、ip、name、
+ * 设备数量、连接数、流量统计。要看这些请用 /admin。
+ */
 export async function healthResponse(env) {
   const cfg = resolveConfig(env);
-  const net = cfg.networkCode ? registry.find(cfg.networkCode) : null;
-  const nets = [];
-  for (const n of registry.networks.values()) nets.push(n.toJSON());
   const backend = await getBackend();
   const storageOk = backend.kind === "blob";
 
-  return Response.json(
-    {
-      ok: true,
-      service: "vnts2-edgeone",
-      protocol: "vnt2",
-      mode: "p2p-punch-only",
-      wsMode: typeof WebSocketPair !== "undefined" ? "websocket-pair" : "callback-object",
-      // storage=blob 才是期望值；memory 说明 Blob SDK 没装上，
-      // 此时服务仍能工作，但**跨实例共享失效**（设备互相看不见）。
-      storage: backend.kind,
-      storageOk,
-      ...(storageOk
-        ? {}
-        : {
-            storageHint:
-              "存储降级为内存，跨实例共享失效。请确认 package.json 里有 @edgeone/pages-blob 依赖，且构建时执行了 npm install。",
-          }),
-      network: cfg.networkCode || null,
-      registeredDevices: net ? net.shared.size : 0,
-      onlineDevices: net ? net.count().online : 0,
-      connectionsTotal: registry.stats.connectionsTotal,
-      bytesSignaled: registry.stats.bytesSignaled,
-      uptimeSeconds: Math.floor((Date.now() - registry.startedAt) / 1000),
-      detail: nets,
-    },
-    { headers: { "cache-control": "no-store" } },
-  );
+  const body = {
+    ok: true,
+    service: "vnts2-edgeone",
+    protocol: "vnt2",
+    mode: "p2p-punch-only",
+    // storage=blob 才是期望值；memory 说明 Blob SDK 没装上，
+    // 此时服务仍能工作，但**跨实例共享失效**（设备互相看不见）。
+    storage: backend.kind,
+    storageOk,
+    // 只回答"配没配"，不透露值
+    configured: !!cfg.networkCode,
+  };
+
+  if (!storageOk) {
+    body.storageHint =
+      "存储降级为内存，跨实例共享失效。请确认 package.json 里有 @edgeone/pages-blob 依赖，且构建时执行了 npm install。";
+  }
+
+  return Response.json(body, { headers: { "cache-control": "no-store" } });
 }
 
-export function statusHtml(env) {
-  const cfg = resolveConfig(env);
-  const net = cfg.networkCode ? registry.find(cfg.networkCode) : null;
-  const devices = net ? net.toJSON().devices : [];
-  const body = JSON.stringify(
-    {
-      networkCode: cfg.networkCode || "(未配置 VNT_NETWORK)",
-      gateway: net ? ipOf(net.gateway) : "-",
-      devices,
-      stats: registry.stats,
-    },
-    null,
-    2,
-  );
+/**
+ * 根路径状态页。**公开**，因此不渲染任何设备信息。
+ * 需要查看设备表请访问 `/admin`（需 Bearer 令牌）。
+ */
+export function statusHtml() {
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vnts2 · EdgeOne · P2P</title>
+<title>vnts2 · EdgeOne</title>
 <style>
   :root { color-scheme: light; }
   body { margin:0; padding:32px; font:14px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif; background:#f7f8fa; color:#1f2328; }
   h1 { font-size:20px; margin:0 0 4px; }
   .sub { color:#656d76; margin-bottom:20px; }
   code { background:#eef1f4; padding:2px 6px; border-radius:4px; }
-  pre { background:#0d1117; color:#e6edf3; padding:16px; border-radius:8px; overflow:auto; font-size:12px; }
   .card { background:#fff; border:1px solid #d8dee4; border-radius:8px; padding:16px 20px; margin-bottom:16px; }
-  .warn { background:#fff8e5; border-color:#e6d9a8; }
+  .muted { color:#656d76; }
 </style>
 </head>
 <body>
   <h1>vnts2 · EdgeOne</h1>
-  <div class="sub">VNT 2.x 服务端 —— <b>纯 P2P 打洞辅助</b>，不中转数据</div>
+  <div class="sub">VNT 2.x 服务端 —— <b>纯 P2P 打洞辅助</b></div>
   <div class="card">
-    <div>客户端连接：<code>server = ["wss://你的域名:443"]</code></div>
-    <div>网络编号：<code>${cfg.networkCode || "未配置 VNT_NETWORK"}</code>（仅来自环境变量）</div>
-    <div>已登记设备：<b>${devices.length}</b>　在线：<b>${net ? net.count().online : 0}</b></div>
-    <div>健康检查：<code>GET /health</code>　设备登记：<code>/admin</code></div>
+    <div>这是个 WebSocket 服务端，供 VNT 客户端连接使用。</div>
+    <div class="muted" style="margin-top:8px">
+      健康检查：<code>GET /health</code><br>
+      管理接口（需鉴权）：<code>/admin</code>
+    </div>
   </div>
-  ${cfg.networkCode ? "" : '<div class="card warn">尚未配置 <code>VNT_NETWORK</code>，客户端无法注册。</div>'}
-  <div class="card" style="color:#656d76">
-    不同实例各自维护连接视图，本页只反映当前实例；设备表与打洞信令经 Blob 共享，
-    因此设备可见性不受影响。
+  <div class="card muted">
+    出于安全考虑，本页不展示任何设备或网络信息。
   </div>
-  <pre>${escapeHtml(body)}</pre>
 </body>
 </html>`;
 }

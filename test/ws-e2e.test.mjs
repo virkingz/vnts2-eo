@@ -40,29 +40,24 @@ function check(name, cond, detail) {
 // ---------------------------------------------------------------------------
 // 最小 socket 替身
 // ---------------------------------------------------------------------------
+/**
+ * 模拟 EdgeOne 注入的 ws 对象。
+ *
+ * 关键：官方模板里它**只有 send 与 close**，没有 addEventListener / on / readyState。
+ * 早期版本我依赖 addEventListener 绑定事件，导致线上收不到任何消息。
+ * 这个替身刻意只暴露 send/close，以便测试能抓住同类回归。
+ */
 class FakeSocket {
   constructor() {
-    this.listeners = new Map();
     this.sent = [];
-    this.readyState = 1;
+    this.closed = false;
   }
-  addEventListener(name, fn) {
-    if (!this.listeners.has(name)) this.listeners.set(name, []);
-    this.listeners.get(name).push(fn);
-  }
-  emit(name, payload) {
-    for (const fn of this.listeners.get(name) || []) fn(payload);
-  }
-  accept() {}
   send(data) {
+    if (this.closed) throw new Error("socket closed");
     this.sent.push(data);
   }
   close() {
-    this.readyState = 3;
-    this.emit("close", {});
-  }
-  receive(bytes) {
-    this.emit("message", { data: bytes });
+    this.closed = true;
   }
   drain() {
     const out = this.sent.slice();
@@ -71,26 +66,22 @@ class FakeSocket {
   }
 }
 
-let lastSocket = null;
-globalThis.WebSocketPair = class {
-  constructor() {
-    this.socket = new FakeSocket();
-    // Node 的 Response 不接受 101，这里只做占位
-    this.response = new Response(null, { status: 200 });
-    this[0] = new FakeSocket();
-    this[1] = this.socket;
-    lastSocket = this.socket;
-  }
-};
-
-/** 建立一条 WS 连接（走真实 onRequest） */
+/** 建立一条 WS 连接：走真实 onRequest，拿到回调对象，再模拟平台触发 onopen */
 async function connect(env = ENV) {
   const ctx = {
     request: new Request("https://x/", { headers: { upgrade: "websocket" } }),
     env,
   };
-  const resp = await onRequest(ctx);
-  return { resp, socket: lastSocket };
+  const result = await onRequest(ctx);
+  const handler = result?.websocket;
+  const ws = new FakeSocket();
+  handler.onopen(ws, ctx.request);
+  return { result, handler, socket: ws };
+}
+
+/** 模拟客户端发来一帧（走平台的 onmessage 回调） */
+function feed(handler, ws, bytes) {
+  handler.onmessage(ws, bytes, true);
 }
 
 /** 让排队的帧处理完（帧是串行链式执行的） */
@@ -261,10 +252,14 @@ console.log("管理 API：设备登记");
 console.log("\n客户端注册（需先登记）");
 
 {
-  const { resp, socket } = await connect();
-  check("升级请求返回 Response", resp instanceof Response);
+  const { result, handler, socket } = await connect();
+  check(
+    "升级请求返回回调对象（EdgeOne 官方形态）",
+    !!handler && typeof handler.onmessage === "function" && typeof handler.onopen === "function",
+    Object.keys(result || {}).join(","),
+  );
 
-  socket.receive(regFrame({ deviceId: "nobody", ip: ipToU32("10.26.2.9") }));
+  feed(handler, socket, regFrame({ deviceId: "nobody", ip: ipToU32("10.26.2.9") }));
   await settle();
   const frames = socket.drain();
   check("未登记设备被拒绝", frames.length >= 1, `收到 ${frames.length} 帧`);
@@ -273,16 +268,16 @@ console.log("\n客户端注册（需先登记）");
 }
 
 {
-  const { socket } = await connect();
-  socket.receive(regFrame({ deviceId: "lede", ip: ipToU32("10.26.2.99") }));
+  const { handler, socket } = await connect();
+  feed(handler, socket, regFrame({ deviceId: "lede", ip: ipToU32("10.26.2.99") }));
   await settle();
   const text = new TextDecoder().decode(socket.drain()[0]);
   check("ip 与登记不符被拒绝", text.includes("不符"), text.slice(0, 80));
 }
 
 {
-  const { socket } = await connect();
-  socket.receive(regFrame({ deviceId: "lede", ip: ipToU32("10.26.2.2") }));
+  const { handler, socket } = await connect();
+  feed(handler, socket, regFrame({ deviceId: "lede", ip: ipToU32("10.26.2.2") }));
   await settle();
   const frames = socket.drain();
   const reg = parseRegResp(frames[0]);
@@ -299,20 +294,24 @@ console.log("\n节点列表与打洞信令");
 
 let sockA;
 let sockB;
+let handlerA;
+let handlerB;
 const ipA = ipToU32("10.26.2.2");
 const ipB = ipToU32("10.26.2.3");
 
 {
   const a = await connect();
-  a.socket.receive(regFrame({ deviceId: "lede", ip: ipA }));
+  feed(a.handler, a.socket, regFrame({ deviceId: "lede", ip: ipA }));
   await settle();
   a.socket.drain();
   sockA = a.socket;
+  handlerA = a.handler;
 
   const b = await connect();
-  b.socket.receive(regFrame({ deviceId: "pc2", ip: ipB }));
+  feed(b.handler, b.socket, regFrame({ deviceId: "pc2", ip: ipB }));
   await settle();
   sockB = b.socket;
+  handlerB = b.handler;
 
   const bFrames = sockB.drain();
   const push = bFrames.find((f) => (f[0] & 0x7f) === MsgType.PushClientIps);
@@ -336,7 +335,7 @@ const ipB = ipToU32("10.26.2.3");
     dest: ipB,
     payload: new Uint8Array([1, 2, 3]),
   }).toUint8Array();
-  sockA.receive(punch);
+  feed(handlerA, sockA, punch);
   await settle();
   const got = sockB.drain();
   check("打洞信令被转发到对端", got.length === 1, `收到 ${got.length} 帧`);
@@ -355,14 +354,14 @@ const ipB = ipToU32("10.26.2.3");
     dest: ipB,
     payload: new Uint8Array([0xde, 0xad]),
   }).toUint8Array();
-  sockA.receive(turn);
+  feed(handlerA, sockA, turn);
   await settle();
   check("业务流量 Turn 不被中转（纯打洞模式）", sockB.drain().length === 0);
 }
 
 {
   sockA.drain();
-  sockA.receive(pingTurn(0));
+  feed(handlerA, sockA, pingTurn(0));
   await settle();
   const push = sockA.drain().find((f) => (f[0] & 0x7f) === MsgType.PushClientIps);
   check("心跳返回节点列表", !!push);
@@ -376,11 +375,13 @@ console.log("\n下线与重连");
 
 {
   sockB.drain();
-  sockA.close();
+  // 模拟平台通知连接关闭：走 handler.onclose（内部会标记离线并广播）
+  handlerA.onclose(sockA);
+  await settle();
   await settle();
   await settle();
   const push = sockB.drain().find((f) => (f[0] & 0x7f) === MsgType.PushClientIps);
-  check("设备断线后对端收到更新", !!push);
+  check("设备断线后对端收到更新", !!push, `收到类型: ${sockB.sent.map((f) => f[0] & 0x7f).join(",")}`);
 
   const res = await admin("/admin/devices/lede");
   check("断线后登记仍保留（可随时重连）", res.status === 200, `实际 ${res.status}`);
@@ -390,8 +391,8 @@ console.log("\n下线与重连");
   const res = await admin("/admin/devices/pc2", { method: "DELETE" });
   check("可删除登记", res.status === 200);
 
-  const { socket } = await connect();
-  socket.receive(regFrame({ deviceId: "pc2", ip: ipB }));
+  const { handler, socket } = await connect();
+  feed(handler, socket, regFrame({ deviceId: "pc2", ip: ipB }));
   await settle();
   const text = new TextDecoder().decode(socket.drain()[0]);
   check("删除登记后无法再连接", text.includes("未登记"), text.slice(0, 80));
@@ -438,8 +439,10 @@ console.log("\n健康检查");
   check("GET /health 返回 200", res.status === 200);
   const body = await res.json();
   check("健康检查标明纯打洞模式", body.mode === "p2p-punch-only", body.mode);
-  check("健康检查带网络编号", body.network === NET);
-  check("健康检查统计已登记设备数", body.registeredDevices === 1, String(body.registeredDevices));
+  check("健康检查不泄露网络编号", body.network === undefined, JSON.stringify(body.network));
+  check("健康检查不泄露设备数量", body.registeredDevices === undefined);
+  check("健康检查只回答配置与否", typeof body.configured === "boolean");
+  check("健康检查响应体不含网络编号字面量", !JSON.stringify(body).includes(NET));
 }
 
 console.log("");

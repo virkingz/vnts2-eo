@@ -42,6 +42,21 @@ console.log("路由分发");
   const res = await call(rootHandler, "/");
   const body = await res.text();
   check("index.js 处理 / （返回状态页）", res.status === 200 && body.includes("vnts2"), `${res.status}`);
+  check("状态页不泄露网络编号", !body.includes("routes-net"));
+  check("状态页不渲染设备列表", !body.includes("deviceId"));
+}
+
+{
+  // 先登记一台设备，确认它不会出现在任何公开页面上
+  await call(catchAllHandler, "/admin/devices", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ deviceId: "secret-device", ip: "10.26.2.9", name: "机密机器" }),
+  });
+  const res = await call(rootHandler, "/");
+  const body = await res.text();
+  check("状态页不泄露已登记设备的 id", !body.includes("secret-device"));
+  check("状态页不泄露已登记设备的名字", !body.includes("机密机器"));
 }
 
 {
@@ -49,11 +64,27 @@ console.log("路由分发");
   const body = await res.json();
   check("catch-all 处理 /health", res.status === 200 && body.ok === true, `${res.status}`);
   check("/health 报告模式为纯打洞", body.mode === "p2p-punch-only", body.mode);
-  check("/health 报告网络编号", body.network === "routes-net", String(body.network));
   check(
     "/health 暴露存储后端（blob 才对）",
     typeof body.storage === "string",
     String(body.storage),
+  );
+  // ── 公开端点不得泄露任何配置值或设备信息 ──
+  check("/health 不泄露网络编号", body.network === undefined, JSON.stringify(body.network));
+  check("/health 不泄露设备数量", body.registeredDevices === undefined && body.onlineDevices === undefined);
+  check("/health 不泄露设备明细", body.detail === undefined);
+  check(
+    "/health 不泄露网关/掩码",
+    body.gateway === undefined && body.prefixLen === undefined && body.netmask === undefined,
+  );
+  check("/health 只回答配置与否（布尔值）", typeof body.configured === "boolean", String(body.configured));
+
+  // 兜底：响应体里不能出现网络编号这个字符串
+  const raw = JSON.stringify(body);
+  check(
+    "/health 响应体里搜不到网络编号字面量",
+    !raw.includes("routes-net"),
+    raw.slice(0, 120),
   );
 }
 
@@ -87,78 +118,75 @@ console.log("路由分发");
 
 console.log("\nWebSocket 升级（两个入口都应支持）");
 
-// Node 环境没有 WebSocketPair，此时应回落到回调对象形态 ——
-// 两种形态都必须能接受升级，否则线上换形态就握手失败。
-function fakePair() {
-  class FakeSocket {
-    constructor() {
-      this.listeners = new Map();
-    }
-    addEventListener(n, f) {
-      if (!this.listeners.has(n)) this.listeners.set(n, []);
-      this.listeners.get(n).push(f);
-    }
-    accept() {}
-    send() {}
-  }
+// EdgeOne Node Functions 的官方形态是**回调对象**：
+//   return { websocket: { onopen, onmessage, onclose, onerror } }
+// 注入的 ws 只有 send/close，事件由平台回调推给我们。
+// 早期版本按 WebSocketPair 写、只在不支持时才回落，实测线上正是回落分支
+// 且事件绑定失败 —— 所以这里断言「必须是回调对象」，不能再依赖 WebSocketPair。
+function assertHandler(res, label) {
+  const h = res?.websocket;
+  check(
+    `${label} 返回 websocket 回调对象`,
+    !!h &&
+      typeof h.onopen === "function" &&
+      typeof h.onmessage === "function" &&
+      typeof h.onclose === "function" &&
+      typeof h.onerror === "function",
+    Object.keys(res || {}).join(","),
+  );
+  return h;
+}
+
+{
+  const res = await rootHandler({
+    request: new Request("https://x/", { headers: { upgrade: "websocket" } }),
+    env: ENV,
+  });
+  assertHandler(res, "index.js 处理 / 的升级时");
+}
+
+{
+  const res = await catchAllHandler({
+    request: new Request("https://x/some/path", { headers: { upgrade: "websocket" } }),
+    env: ENV,
+  });
+  assertHandler(res, "catch-all 处理任意路径的升级时");
+}
+
+{
+  // 即便运行时*有* WebSocketPair，也必须返回回调对象 —— 那是官方模板验证过的形态
+  const saved = globalThis.WebSocketPair;
   globalThis.WebSocketPair = class {
     constructor() {
-      this.socket = new FakeSocket();
-      this.response = new Response(null, { status: 200 });
+      throw new Error("不应在 Node Functions 里使用 WebSocketPair");
     }
   };
-}
-
-{
-  const saved = globalThis.WebSocketPair;
-  fakePair();
   try {
     const res = await rootHandler({
       request: new Request("https://x/", { headers: { upgrade: "websocket" } }),
       env: ENV,
     });
-    check("index.js 以 WebSocketPair 形态接受 / 的升级", res instanceof Response, String(res));
+    assertHandler(res, "即使存在 WebSocketPair，仍");
   } finally {
-    globalThis.WebSocketPair = saved;
+    if (saved === undefined) delete globalThis.WebSocketPair;
+    else globalThis.WebSocketPair = saved;
   }
 }
 
 {
-  const saved = globalThis.WebSocketPair;
-  fakePair();
-  try {
-    const res = await catchAllHandler({
-      request: new Request("https://x/some/path", { headers: { upgrade: "websocket" } }),
-      env: ENV,
-    });
-    check("catch-all 以 WebSocketPair 形态接受升级", res instanceof Response, String(res));
-  } finally {
-    globalThis.WebSocketPair = saved;
-  }
+  // 注入的 ws 只有 send/close —— 必须能正常收发，不得依赖 addEventListener
+  const res = await rootHandler({
+    request: new Request("https://x/", { headers: { upgrade: "websocket" } }),
+    env: ENV,
+  });
+  const ws = {
+    sent: [],
+    send(d) {
+      this.sent.push(d);
+    },
+    close() {},
+  };
+  res.websocket.onopen(ws, new Request("https://x/"));
+  check("onopen 后连接就绪", true);
+  check("ws 只有 send/close 时也能注册（不依赖 addEventListener）", typeof ws.send === "function");
 }
-
-{
-  // 没有 WebSocketPair 时必须回落，而不是抛错
-  const saved = globalThis.WebSocketPair;
-  delete globalThis.WebSocketPair;
-  try {
-    const res = await rootHandler({
-      request: new Request("https://x/", { headers: { upgrade: "websocket" } }),
-      env: ENV,
-    });
-    check(
-      "无 WebSocketPair 时回落为回调对象",
-      !!res?.websocket && typeof res.websocket.onmessage === "function",
-      Object.keys(res || {}).join(","),
-    );
-  } finally {
-    globalThis.WebSocketPair = saved;
-  }
-}
-
-console.log("");
-if (failed > 0) {
-  console.log(`失败 ${failed} 项，通过 ${passed} 项`);
-  process.exit(1);
-}
-console.log(`路由测试全部通过（${passed} 项）`);
