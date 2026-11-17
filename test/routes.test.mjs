@@ -164,25 +164,9 @@ function fakePair() {
 
 // ── 无 WebSocketPair 时：必须回落回调对象（当前线上就是这种） ──
 {
-  // ★ 关键回归：升级路径必须**同步**返回，不能是 Promise。
-  // 升级请求走 async 函数时，平台拿到的是 Promise 而非 Response，
-  // 握手失败并报 502 CLOUD_FUNCTION_INVOCATION_FAILED；
-  // 而普通 HTTP 能处理 Promise —— 这正是「/health 正常、wss 连不上」的根因。
-  const saved = globalThis.WebSocketPair;
-  delete globalThis.WebSocketPair;
-  try {
-    const out = rootHandler({
-      request: new Request("https://x/", { headers: { upgrade: "websocket" } }),
-      env: ENV,
-    });
-    check(
-      "升级路径同步返回（不是 Promise）",
-      !(out instanceof Promise) && !!out?.websocket,
-      out instanceof Promise ? "返回了 Promise，会导致 502" : String(out),
-    );
-  } finally {
-    if (saved !== undefined) globalThis.WebSocketPair = saved;
-  }
+  // 升级路径用 async 也可以 —— 官方 WebSocket 模板就是 async onRequest，
+  // 实测能给 101。曾经误以为必须同步返回、并据此改过代码，是错的。
+  // 这里有 WebSocketPair 不被使用这一条就够了（见下）。
 }
 
 {

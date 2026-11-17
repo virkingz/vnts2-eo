@@ -35,7 +35,7 @@ import { probeWebSocket } from "./ws.js";
  * 构建标记。每次改动部署时手动更新，用于从 /health 判断部署是否生效。
  * 换成一个单调递增的时间戳字符串。
  */
-const BUILD_REV = "r2026-11-17T23:00-wsx";
+const BUILD_REV = "1.0.0";
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -93,8 +93,8 @@ export async function healthResponse(env) {
 
   const body = {
     ok: true,
-    // 部署版本标记：用于确认「代码是否真的部署上去了」。
-    // 之前 /health 每次返回完全一致，无法判断部署是否生效，掩盖了很多问题。
+    // 版本标记：用于确认「代码是否真的部署上去了」。
+    // 曾经的排查盲区 —— /health 每次返回完全一致，无法判断部署是否生效。
     rev: BUILD_REV,
     service: "vnts2-edgeone",
     protocol: "vnt2",

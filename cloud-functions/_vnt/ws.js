@@ -160,10 +160,10 @@ function connOf(ws) {
  */
 export function createWebSocketHandler(env) {
   return {
-    onopen(ws) {
+    async onopen(ws) {
       registerConnection(ws, env);
     },
-    onmessage(ws, message) {
+    async onmessage(ws, message) {
       connOf(ws)?.feed(message);
     },
     onclose(ws) {

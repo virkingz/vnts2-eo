@@ -24,7 +24,7 @@ import { acceptWebSocket } from "./_vnt/ws.js";
  *
  * 因此这里刻意不写 async：升级路径同步返回，HTTP 路径返回 Promise<Response> 即可。
  */
-export const onRequest = (context) => {
+export const onRequest = async (context) => {
   const { request, env } = context;
   const upgrade = request.headers.get("Upgrade") || request.headers.get("upgrade");
 
