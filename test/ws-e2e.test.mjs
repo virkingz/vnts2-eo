@@ -380,6 +380,41 @@ if (offlinePush) {
   check("该设备在列表里被标为离线", !!peer && peer.online === false);
 }
 
+
+// ---------------------------------------------------------------------------
+// 运行时形态自适应：没有 WebSocketPair 时应回落到回调对象
+// ---------------------------------------------------------------------------
+console.log("\n运行时形态自适应");
+{
+  const saved = globalThis.WebSocketPair;
+  delete globalThis.WebSocketPair;
+  try {
+    const ctx = {
+      request: new Request("https://x/", { headers: { upgrade: "websocket" } }),
+      env: {},
+    };
+    const result = await onRequest(ctx);
+    check(
+      "无 WebSocketPair 时回落到 { websocket: { onopen, onmessage, ... } }",
+      !!result && !!result.websocket && typeof result.websocket.onmessage === "function",
+      `拿到 ${Object.keys(result || {}).join(",")}`,
+    );
+
+    // 这条回退路径也要能真正完成注册
+    const ws = new FakeSocket();
+    result.websocket.onopen(ws);
+    result.websocket.onmessage(ws, regFrame({ networkCode: "legacy-ws", deviceId: "L" }));
+    const frames = ws.drain();
+    check("回调对象形态同样能完成注册", frames.length >= 1);
+    if (frames[0]) {
+      const resp = parseRegResp(frames[0]);
+      check("回调对象形态下 server_instance_id 也是 32 字节", resp[8]?.length === 32);
+    }
+  } finally {
+    globalThis.WebSocketPair = saved;
+  }
+}
+
 console.log("");
 if (failed > 0) {
   console.log(`失败 ${failed} 项`);

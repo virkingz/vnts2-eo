@@ -71,18 +71,22 @@ Cloud Functions 是**请求级无状态**：「每次请求独立分配执行环
 
 ### 2. 握手失败，返回 200 HTML 或直接报错
 
-**WebSocket 升级的返回值形态写错了。**
-EdgeOne Node Functions 只认这一种：
+**WebSocket 升级的返回值形态写错了。** EdgeOne 上见过两种约定，两边不通用：
 
 ```js
+// A) 官方 Node Functions 文档 / 官方模板的写法
 const { socket, response } = new WebSocketPair();
 socket.addEventListener("message", ...);
-return response;   // ← 返回 Response
+return response;
+
+// B) 回调对象（部分文档 / 边缘函数形态）
+return { websocket: { onopen, onmessage, onclose, onerror } };
 ```
 
-返回 `{ websocket: { onopen, onmessage } }` 这种自定义对象是**别的平台**的约定，
-EdgeOne 会直接当作非法返回。本仓库的 `cloud-functions/index.js`
-同时兼容了 EdgeOne 的 `{socket, response}` 与 Cloudflare 的 `[client, server]` 两种形态。
+把 A 写成 B（或反过来）都会握手失败。本仓库 `cloud-functions/index.js`
+**做能力探测**：有 `WebSocketPair` 就用 A，没有才回落 B；
+A 内部还同时兼容 EdgeOne 的 `{socket, response}` 与 Cloudflare 的 `[client, server]`。
+`/health` 返回的 `wsMode` 字段会告诉线上当前用的是哪一种。
 
 ### 3. 部署后 `/` 访问不到函数，返回静态文件或 404
 
@@ -219,7 +223,7 @@ npm test
 
 包含两组：
 - `test/protocol.test.js` —— 27 项协议/流程自测（编解码、IP 分配、白名单、中继）
-- `test/ws-e2e.test.mjs` —— 20 项接入层 e2e，覆盖 `server_instance_id` 长度、
+- `test/ws-e2e.test.mjs` —— 23 项接入层 e2e，覆盖 `server_instance_id` 长度、
   `is_all` 语义、上下线主动广播、心跳、重连竞态这些**只有真实客户端才会暴露**的约束
 
 ---
