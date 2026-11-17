@@ -1,8 +1,6 @@
 {
   "name": "vnts2-edgeone",
   "installCommand": "npm install",
-  "buildCommand": "",
-  "outputDirectory": "",
   "nodeVersion": "20.18.0",
   "cloudFunctions": {
     "maxDuration": 120
