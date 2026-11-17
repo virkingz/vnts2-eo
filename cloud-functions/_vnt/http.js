@@ -35,7 +35,7 @@ import { probeWebSocket } from "./ws.js";
  * 构建标记。每次改动部署时手动更新，用于从 /health 判断部署是否生效。
  * 换成一个单调递增的时间戳字符串。
  */
-const BUILD_REV = "1.0.0";
+const BUILD_REV = "1.0.2-nf";
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
