@@ -221,12 +221,18 @@ return { websocket: { onopen, onmessage, onclose, onerror } };
 默认测试域名（`*.edgeone.app`）走**海外节点**。要在中国大陆有低延迟，
 必须绑定**已备案**的自定义域名并选择中国大陆加速区域。
 
-### 10. 部署后设备互相看不见
+### 10. `/health` 或 `/admin` 返回 404
+EdgeOne 是**文件即路由**：`cloud-functions/index.js` **只映射到 `/`**，
+不会处理 `/health`、`/admin/*` —— 这些路径会去找不存在的同名文件然后掉进静态 404。
+必须有一个 catch-all 入口 `cloud-functions/[[default]].js` 兜底。
+本仓库两个入口共用 `_vnt/http.js` 与 `_vnt/ws.js` 的同一份实现。
+
+### 11. 部署后设备互相看不见
 存储降级为内存后端了 —— 十有八九是构建时没执行 `npm install`，
 `@edgeone/pages-blob` 没装上。**这种情况下服务不会报错**，只是跨实例共享失效。
 访问 `/health` 看 `storage` 字段：`blob` 才对，`memory` 就是降级了。
 
-### 11. 消息类型编号不要杜撰
+### 12. 消息类型编号不要杜撰
 VNT 2.x 的 `MsgType` 里，**33 号是未分配的**（客户端 `try_from(33u8)` 会报错）。
 早期版本这里写了 `Application: 33`，属杜撰 —— 多发一个非法类型比少一个更危险。
 
@@ -252,8 +258,11 @@ VNT 2.x 的 `MsgType` 里，**33 号是未分配的**（客户端 `try_from(33u8
 ```
 vnts2-edgeone/
 ├── cloud-functions/              # EdgeOne 函数目录（目录前缀不进 URL）
-│   ├── index.js                  # WebSocket 入口 + 状态页 + /health + /admin 分发
+│   ├── index.js                  # 根路径入口（文件即路由 → 只映射 /）
+│   ├── [[default]].js            # catch-all 入口 → /health、/admin/* 等
 │   └── _vnt/                     # 下划线开头 = 内部模块，不生成路由
+│       ├── ws.js                 # WebSocket 接入（两种运行时形态）
+│       ├── http.js               # HTTP 路由分发 + /health + 状态页
 │       ├── admin.js              # 设备登记管理 API
 │       ├── protobuf.js           # 最小 protobuf3 读写
 │       ├── packet.js             # VNT 2.x 16 字节帧头 + MsgType
@@ -264,7 +273,8 @@ vnts2-edgeone/
 ├── test/
 │   ├── protocol.test.js          # 协议 + 登记 + 端到端（31 项）
 │   ├── shared-state.test.js      # 跨实例共享（11 项）
-│   └── ws-e2e.test.mjs           # 接入层 e2e（41 项）
+│   ├── ws-e2e.test.mjs           # 接入层 e2e（41 项）
+│   └── routes.test.mjs           # 双入口路由分发（12 项）
 ├── edgeone.json
 ├── package.json
 └── README.md
@@ -281,6 +291,7 @@ npm test
 - `protocol.test.js` —— 编解码、设备登记、保留地址校验、打洞信令、不中转业务流量
 - `shared-state.test.js` —— **跨实例**：设备表共享、并发写不丢数据、信令经信箱投递
 - `ws-e2e.test.mjs` —— 接入层：`/admin` API、注册校验、两种 WS 形态、健康检查
+- `routes.test.mjs` —— 两个入口各自负责哪些路径（`/` vs `/health` vs `/admin/*`）
 
 本地跑时 Blob 会降级为内存后端（没有 EdgeOne 凭据），跨实例测试用共享的内存后端模拟。
 
