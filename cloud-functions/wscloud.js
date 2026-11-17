@@ -1,14 +1,17 @@
-// A/B 实验 B：cloud-functions/ 目录下的最小 WS 处理器 → 路径 /wscloud
+// B：cloud-functions/ 目录 + **回调对象**形态（不碰 WebSocketPair）
+// 验证：运行时没有 WebSocketPair，用它必然抛 ReferenceError → 502；
+// 改用官方模板的回调对象形态应当能 101。
 export function onRequest(context) {
   const upgrade = context.request.headers.get("Upgrade");
   if (!upgrade || upgrade.toLowerCase() !== "websocket") {
-    return new Response("B:cloud-functions", { status: 200 });
+    return new Response("B2:cloud-functions(callback-object)", { status: 200 });
   }
-  const { socket, response } = new WebSocketPair();
-  socket.addEventListener("message", (e) => {
-    try { socket.send(e.data); } catch {}
-  });
-  socket.addEventListener("close", () => {});
-  socket.addEventListener("error", () => {});
-  return response;
+  return {
+    websocket: {
+      onopen(ws) { try { ws.send("B2-open"); } catch {} },
+      onmessage(ws, m) { try { ws.send(m); } catch {} },
+      onclose() {},
+      onerror() {},
+    },
+  };
 }
