@@ -310,47 +310,7 @@ function safeKeys(obj) {
  * 502 CLOUD_FUNCTION_INVOCATION_FAILED，真实原因完全丢失。
  * 出问题时返回可读的 500 Response，便于用 curl 直接看到原因。
  */
-export function acceptWebSocket(env, request) {
-  // ── 升级上下文探测 ──
-  // 关键：HTTP 上下文里没有 WebSocketPair，不代表升级上下文也没有。
-  // 前两次我拿 HTTP 上下文的探测结果去决定升级走哪条路，都猜错了。
-  // 这里在**升级上下文内部**探测，返回 JSON 供 curl 查看。
-  try {
-    const url = request ? new URL(request.url) : null;
-    if (url && url.searchParams.has("wsprobe")) {
-      const globals = [];
-      try {
-        for (const k of Object.keys(globalThis)) {
-          const lk = k.toLowerCase();
-          if (lk.includes("socket") || lk.includes("web") || lk.includes("upgrade")) {
-            globals.push(`${k}:${typeof globalThis[k]}`);
-          }
-        }
-      } catch {
-        globals.push("(无法枚举 globalThis)");
-      }
-      return Response.json(
-        {
-          inUpgradeContext: true,
-          hasWebSocketPair: typeof WebSocketPair !== "undefined",
-          wsPairType: typeof WebSocketPair,
-          globals,
-          requestHeaders: (() => {
-            try {
-              return Object.fromEntries(request.headers);
-            } catch {
-              return "(不可读)";
-            }
-          })(),
-        },
-        { headers: { "cache-control": "no-store" } },
-      );
-    }
-  } catch (e) {
-    // 探测失败不影响正常流程
-    void e;
-  }
-
+export function acceptWebSocket(env) {
   const notes = [];
 
   // 优先 WebSocketPair（官方 Node Functions 文档的写法，返回标准 Response）
