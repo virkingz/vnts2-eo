@@ -441,7 +441,9 @@ test("两个客户端注册后可通过服务端中继互发数据", () => {
   const sa = new Session(env);
   const okA = sa.handleFirstFrame(encodeRegRequestFixture({ networkCode: netCode, deviceId: "A" }), (b) => outA.push(b));
   assert.equal(okA, true);
-  assert.equal(outA.length, 1);
+  // 第一帧必须是注册响应；其后可能紧跟一次节点列表推送（注册后主动推送）
+  assert.ok(outA.length >= 1, `至少应有一帧注册响应，实际 ${outA.length}`);
+  assert.equal(outA[0][0] >> 3, 1, "首帧应是 ResponseMessage 的 reg（field 1）");
 
   const sb = new Session(env);
   const okB = sb.handleFirstFrame(

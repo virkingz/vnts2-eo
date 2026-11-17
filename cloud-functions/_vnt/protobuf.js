@@ -89,6 +89,7 @@ export class Writer {
   }
 
   writeFixed64(value) {
+    this._ensure(8);
     let big = BigInt(value);
     if (big < 0n) big += 1n << 64n;
     for (let i = 0; i < 8; i++) {

@@ -1,99 +1,64 @@
 // vnts2 for EdgeOne — WebSocket 接入层
 //
-// EdgeOne Cloud Functions(Node.js 20) 的 WebSocket 约定：
-//   export const onRequest = async (context) => {
-//     if (是 upgrade 请求) return { websocket: { onopen, onmessage, onclose, onerror } };
-//     return new Response(...);
+// EdgeOne Pages · Cloud Functions（Node.js 20）的 WebSocket 约定：
+//
+//   export function onRequest(context) {
+//     const { socket, response } = new WebSocketPair();
+//     socket.addEventListener("message", (e) => { ... });
+//     return response;
 //   }
 //
+// 注意：**不能**返回 `{ websocket: {...} }` 这类自定义对象 —— 那是别的平台的
+// 约定，EdgeOne 会把它当成非法返回值，握手直接失败。
+//
 // VNT 2.x 客户端的 WSS 地址由 `wss://host:port` 构造（不带路径），
-// 因此 WebSocket 必须挂在站点根路径 `/`。非 upgrade 的 GET / 返回状态页。
+// 因此 WebSocket 必须挂在站点根路径 `/`（即本文件）。
+// 非 upgrade 的 GET / 返回状态页，`/health` 返回 JSON 健康检查。
 
 import { Session } from "./_vnt/server.js";
 import { registry } from "./_vnt/state.js";
 import { decodeRequestMessage } from "./_vnt/control-messages.js";
 
-/** 每个 WebSocket 连接一个 Session（挂在 ws 上，跟随连接生命周期） */
-function createHandler(env) {
-  return {
-    onopen(ws, request) {
-      try {
-        const session = new Session(env || {});
-        ws.__vnt = session;
-        registry.stats.connectionsTotal++;
-      } catch (e) {
-        try {
-          ws.close();
-        } catch {
-          /* ignore */
-        }
-      }
-    },
-
-    onmessage(ws, message, isBinary) {
-      const session = ws.__vnt;
-      if (!session) return;
-
-      const bytes = normalize(message);
-      if (!bytes) return;
-
-      const send = (data) => {
-        try {
-          ws.send(data);
-        } catch {
-          /* 连接已断开，忽略 */
-        }
-      };
-
-      try {
-        if (!session.registered) {
-          // 首帧：裸 protobuf RequestMessage
-          session.handleFirstFrame(bytes, send);
-          return;
-        }
-        if (session.pendingConfirm) {
-          // 预注册第二阶段：等待 ConfirmReg
-          const { kind } = safeDecodeRequest(bytes);
-          if (kind === "confirm_reg") {
-            session.handleConfirm(send);
-            return;
-          }
-          // 其它帧在待确认阶段忽略
-          return;
-        }
-        session.handleDataPacket(bytes, send);
-      } catch {
-        // 单帧异常不应断开连接；交由上层超时/心跳回收
-      }
-    },
-
-    onclose(ws) {
-      const session = ws.__vnt;
-      if (session) {
-        session.onClose();
-        ws.__vnt = null;
-      }
-    },
-
-    onerror(ws) {
-      const session = ws.__vnt;
-      if (session) {
-        session.onClose();
-        ws.__vnt = null;
-      }
-    },
-  };
+/** 尽可能广泛地兼容不同运行时的 socket 事件绑定方式 */
+function on(socket, name, handler) {
+  if (typeof socket.addEventListener === "function") {
+    socket.addEventListener(name, handler);
+    return true;
+  }
+  if (typeof socket.on === "function") {
+    // 部分 Node 实现把 message 回调签名为 (data, isBinary)
+    socket.on(name, (arg, isBinary) => handler({ data: arg, isBinary }));
+    return true;
+  }
+  const prop = `on${name}`;
+  if (prop in socket || typeof socket[prop] !== "function") {
+    socket[prop] = handler;
+    return true;
+  }
+  return false;
 }
 
+/** 把一帧数据统一成 Uint8Array */
 function normalize(message) {
+  if (!message) return null;
   if (message instanceof Uint8Array) return message;
   if (message instanceof ArrayBuffer) return new Uint8Array(message);
   if (Array.isArray(message)) return new Uint8Array(message);
   if (typeof message === "string") return new TextEncoder().encode(message);
-  if (message && message.buffer) {
+  if (typeof Buffer !== "undefined" && Buffer.isBuffer?.(message)) {
+    return new Uint8Array(message.buffer, message.byteOffset, message.byteLength);
+  }
+  if (message.buffer) {
     return new Uint8Array(message.buffer, message.byteOffset || 0, message.byteLength);
   }
   return null;
+}
+
+/** 从 message 事件里取出裸数据 */
+function eventData(event) {
+  if (event == null) return null;
+  if (typeof event === "object" && "data" in event) return event.data;
+  return event;
 }
 
 function safeDecodeRequest(bytes) {
@@ -104,30 +69,118 @@ function safeDecodeRequest(bytes) {
   }
 }
 
-export const onRequest = async (context) => {
-  const { request, env } = context;
-  const upgrade = request.headers.get("upgrade") || request.headers.get("Upgrade");
-
-  if (upgrade && upgrade.toLowerCase() === "websocket") {
-    return { websocket: createHandler(env) };
+/** 全部连接处理逻辑都挂在这个 socket 上，生命周期跟随连接 */
+function bindSocket(socket, env) {
+  let session;
+  try {
+    session = new Session(env || {});
+    registry.stats.connectionsTotal++;
+  } catch {
+    try {
+      socket.close();
+    } catch {
+      /* ignore */
+    }
+    return;
   }
 
-  // 非 upgrade 请求：给人看的说明页 / 健康检查
+  const send = (data) => {
+    try {
+      socket.send(data);
+    } catch {
+      /* 连接已断开，忽略 */
+    }
+  };
+
+  on(socket, "message", (event) => {
+    const bytes = normalize(eventData(event));
+    if (!bytes || bytes.length === 0) return;
+
+    try {
+      if (!session.registered) {
+        // 首帧：裸 protobuf RequestMessage
+        session.handleFirstFrame(bytes, send);
+        return;
+      }
+      if (session.pendingConfirm) {
+        // 预注册第二阶段：等待 ConfirmReg
+        const { kind } = safeDecodeRequest(bytes);
+        if (kind === "confirm_reg") session.handleConfirm(send);
+        return;
+      }
+      session.handleDataPacket(bytes, send);
+    } catch {
+      // 单帧异常不应断开连接；交由上层超时/心跳回收
+    }
+  });
+
+  on(socket, "close", () => {
+    session.onClose();
+  });
+
+  on(socket, "error", () => {
+    session.onClose();
+  });
+}
+
+/**
+ * 建立 WebSocket。
+ *
+ * EdgeOne 的 `WebSocketPair` 解构出 `{ socket, response }`；
+ * Cloudflare 风格则返回 `[client, server]`。两种都支持，避免换平台后静默失败。
+ */
+function acceptWebSocket(env) {
+  if (typeof WebSocketPair === "undefined") {
+    throw new Error("当前运行时不提供 WebSocketPair，无法接受 WebSocket 连接");
+  }
+  const pair = new WebSocketPair();
+
+  // EdgeOne 形态：{ socket, response }
+  if (pair && pair.socket && pair.response) {
+    pair.socket.accept?.();
+    bindSocket(pair.socket, env);
+    return pair.response;
+  }
+
+  // Cloudflare Worker 形态：[client, server]
+  if (Array.isArray(pair) || typeof pair[0] !== "undefined") {
+    const client = pair[0];
+    const server = pair[1];
+    server.accept?.();
+    bindSocket(server, env);
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  throw new Error("WebSocketPair 返回值形态未知");
+}
+
+export const onRequest = async (context) => {
+  const { request, env } = context;
+  const upgrade = request.headers.get("Upgrade") || request.headers.get("upgrade");
+
+  if (upgrade && upgrade.toLowerCase() === "websocket") {
+    return acceptWebSocket(env);
+  }
+
   const url = new URL(request.url);
   if (url.pathname === "/health" || url.pathname === "/healthz") {
+    const nets = [];
+    for (const net of registry.networks.values()) nets.push(net.toJSON());
     return Response.json({
       ok: true,
       service: "vnts2-edgeone",
       protocol: "vnt2",
       networks: registry.networks.size,
       connectionsTotal: registry.stats.connectionsTotal,
+      bytesRelayed: registry.stats.bytesRelayed,
       uptimeSeconds: Math.floor((Date.now() - registry.startedAt) / 1000),
+      detail: nets,
     });
   }
 
   return new Response(statusHtml(), {
     status: 200,
-    headers: { "content-type": "text/html; charset=utf-8" },
+    headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
   });
 };
 
@@ -153,10 +206,11 @@ function statusHtml() {
 </head>
 <body>
   <h1>vnts2 · EdgeOne</h1>
-  <div class="sub">VNT 2.x 服务端（WebSocket 中继）。客户端连接：<code>-s wss://你的域名</code></div>
+  <div class="sub">VNT 2.x 服务端（WebSocket 中继）。客户端连接：<code>server = ["wss://你的域名:443"]</code></div>
   <div class="card">
     <div>健康检查：<code>GET /health</code></div>
     <div>当前实例网络数：<b>${registry.networks.size}</b>，累计连接：<b>${registry.stats.connectionsTotal}</b></div>
+    <div style="color:#656d76;margin-top:8px">注意：EdgeOne 无全局单例原语，不同实例各自维护房间表；本页只反映当前实例。</div>
   </div>
   <pre>${escapeHtml(body)}</pre>
 </body>

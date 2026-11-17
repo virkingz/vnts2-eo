@@ -70,6 +70,7 @@ export class Session {
     this.instanceId = "";
     this.inviteCode = ""; // 可选白名单（VNT_VISIT_CODE）
     this.closed = false;
+    this.connToken = undefined;
     this.net = null;
     this.createdAt = Date.now();
   }
@@ -164,6 +165,7 @@ export class Session {
     this.clientType = reg.clientType;
     this.net = net;
     this.instanceId = result.entry.instanceId;
+    this.connToken = result.entry.connToken;
     result.entry.sender = send;
 
     const isPreRegister = reg.registrationMode === RegistrationMode.PRE_REGISTER;
@@ -184,7 +186,64 @@ export class Session {
         applicationChannelSupported: false,
       }),
     );
+
+    // 注册后立刻推一次全量邻居列表，客户端据此建立打洞目标
+    this._pushClientIps(send, { force: true });
+    // 其它在线设备也要立即知道有新成员，而不是等它们下次心跳
+    this._broadcastClientIps();
     return true;
+  }
+
+  /**
+   * 向本连接推送节点列表。
+   * @param {(bytes: Uint8Array) => void} send
+   */
+  _pushClientIps(send, { force = false, time = 0 } = {}) {
+    if (!this.net) return false;
+    const list = this.net.fullList(this.ip, this.net.dataVersion, time);
+    if (!list) return false;
+    void force;
+    const payload = encodeClientSimpleInfoList(list);
+    const pkt = buildPacket({
+      msgType: MsgType.PushClientIps,
+      ttl: 1,
+      gateway: true,
+      src: this.net.gateway,
+      dest: this.ip,
+      payload,
+    });
+    send(pkt.toUint8Array());
+    return true;
+  }
+
+  /**
+   * 把最新节点列表广播给本网络其它在线设备。
+   *
+   * 之前只在客户端自己心跳时按 data_version 判断要不要推：一旦某次推送
+   * 因链路抖动丢失，对端就会长期停在陈旧快照上（表现为「明明在线却显示离线」）。
+   * 上下线属于低频事件，直接主动推全量最省事也最可靠。
+   */
+  _broadcastClientIps() {
+    if (!this.net) return;
+    for (const peer of this.net.onlineEntries()) {
+      if (peer.deviceId === this.deviceId) continue;
+      if (typeof peer.sender !== "function") continue;
+      try {
+        const list = this.net.fullList(peer.ip, this.net.dataVersion, 0);
+        const payload = encodeClientSimpleInfoList(list);
+        const pkt = buildPacket({
+          msgType: MsgType.PushClientIps,
+          ttl: 1,
+          gateway: true,
+          src: this.net.gateway,
+          dest: peer.ip,
+          payload,
+        });
+        peer.sender(pkt.toUint8Array());
+      } catch {
+        // 单个对端发送失败不影响其它对端
+      }
+    }
   }
 
   _instanceIdString(bytes) {
@@ -315,25 +374,12 @@ export class Session {
           const dataVersion = _readU64(bytes, HEAD_LENGTH + 8);
           let pushed = false;
           const net = this.net;
+          // 版本没变就只回 PongTurn（省流）；变了推全量快照。
+          // 增量（is_all=false）会让客户端 extend 合并、只增不删，
+          // 历史条目永远留在缓存里显示成离线，所以这里一律发全量。
           if (dataVersion !== net.dataVersion) {
             const now = _readI64(bytes, HEAD_LENGTH);
-            const list =
-              dataVersion === 0 || dataVersion > net.dataVersion || dataVersion < net.fullSyncVersion
-                ? net.fullList(this.ip, net.dataVersion, now)
-                : net.changedList(this.ip, dataVersion, now);
-            if (list) {
-              const payload = encodeClientSimpleInfoList(list);
-              const pkt = buildPacket({
-                msgType: MsgType.PushClientIps,
-                ttl: 1,
-                gateway: true,
-                src: net.gateway,
-                dest: this.ip,
-                payload,
-              });
-              send(pkt.toUint8Array());
-              pushed = true;
-            }
+            pushed = this._pushClientIps(send, { time: now });
           }
           if (!pushed) {
             const reply = new Uint8Array(bytes);
@@ -400,9 +446,13 @@ export class Session {
 
   /** 连接关闭清理 */
   onClose() {
+    if (this.closed) return;
     this.closed = true;
     if (this.net && this.deviceId) {
-      this.net.offline(this.deviceId);
+      // connToken 不匹配时 offline() 返回 null —— 说明设备已被新连接接管，
+      // 此时绝不能广播「它离线了」，否则会把刚上线的新连接一起打掉。
+      const entry = this.net.offline(this.deviceId, this.connToken);
+      if (entry) this._broadcastClientIps();
     }
   }
 
