@@ -26,7 +26,7 @@ export const onRequest = (context) => {
   const upgrade = request.headers.get("Upgrade") || request.headers.get("upgrade");
 
   if (upgrade && upgrade.toLowerCase() === "websocket") {
-    return acceptWebSocket(env);
+    return acceptWebSocket(env, request);
   }
 
   return handleHttp(request, env);
