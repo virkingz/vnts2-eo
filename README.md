@@ -176,21 +176,48 @@ vnt -s wss://你的域名:443 \
 ### 1. 客户端一直「未连接」，服务端毫无日志
 地址没带端口。见上一节。
 
-### 2. 握手失败，返回 200 HTML 或直接报错
-WebSocket 升级的返回值形态写错了。EdgeOne 上见过两种约定，**两边不通用**：
+### 2. 握手恒返回 502 —— 缺 `ws` 依赖（最隐蔽的一个）
 
-```js
-// A) 官方 Node Functions 文档 / 官方模板
-const { socket, response } = new WebSocketPair();
-socket.addEventListener("message", ...);
-return response;
+现象：**HTTP 全部正常，只有带 `Upgrade` 头的请求恒定 502**
+（`CLOUD_FUNCTION_INVOCATION_FAILED`），连函数里一行 WS 代码都没有的
+`/health` 加升级头也 502。
 
-// B) 回调对象
-return { websocket: { onopen, onmessage, onclose, onerror } };
+根因：`package.json` 缺 `ws` 依赖 —— **平台的 WebSocket 桥接依赖该包**。
+
+定位方式是单变量对照（参照 [edgeone-edgetunnel](https://github.com/Theadvocate-bit/edgeone-edgetunnel)
+的排障记录，它在 EdgeOne Pages Node Functions 上跑 VLESS over WS）：
+
+| 项目 | websocket 文件 | package type | `ws` 依赖 | 结果 |
+|---|---|---|---|---|
+| A | `.ts` | commonjs | ✅ | **101** |
+| B | `.ts` | module | ✅ | **101** |
+| C | `.js` | commonjs | ✅ | **101** |
+| D | `.js` | commonjs | ❌ | **502** |
+| E | `.js` | module | ❌ | **502** |
+
+前三个文件类型/模块制式各异却都握手成功；**只改 `ws` 依赖的那次立刻失败**。
+结论：`ws` 依赖是唯一决定因素，与 `.ts`/`.js`、commonjs/module 无关。
+
+```jsonc
+// package.json —— 这一行是 WebSocket 能握手的前提
+"dependencies": {
+  "ws": "^8.18.3"
+}
 ```
 
-本仓库**做能力探测**：有 `WebSocketPair` 用 A，否则回落 B。
-`/health` 的 `wsMode` 字段会告诉你线上走的是哪一种。
+另外：**目录必须是 `node-functions/`**。CLI 的选择逻辑是
+`cloud-functions/` 优先于 `node-functions/`，只要前者存在就忽略后者；
+而只有 Node Functions 支持 WebSocket（Cloud Functions 不支持）。
+
+### 2b. 曾误判的方向（都已证伪，勿再走）
+
+排查过程中我改过下面这些，**全部无效**，记录在此以免重蹈：
+
+- `WebSocketPair` 形态 ↔ 回调对象形态（两种都试过；本运行时无 `WebSocketPair` 全局）
+- `async` ↔ 同步 `onRequest`（官方模板本身就是 async）
+- 根路径 `/` ↔ 子路径 `/websocket`、专用文件 ↔ catch-all
+- `edgeone.json` 的 `buildCommand` / `outputDirectory` 空字符串
+- 自定义域名 ↔ 原生域名（两者 CNAME 与结果一致）
 
 ### 3. 部署后 `/` 访问不到函数
 根目录有 `index.html`。静态资源优先于函数，把 `/` 的升级请求吃掉了。
@@ -298,6 +325,22 @@ npm test
 ---
 
 ## 限制（平台约束，非代码问题）
+
+> ⚠️ **当前平台数据面不中继 WebSocket 数据帧**（2026-11 实测）。
+> 101 握手成功，但连接在数毫秒内被关闭，`onmessage` 从不触发、
+> 协议层 ping 收不到 pong，`/echo` 纯回显端点同样如此。
+> **官方模板（官方账号）表现完全相同** —— 这是平台当前状态，非本项目代码问题。
+> 与 [edgeone-edgetunnel](https://github.com/Theadvocate-bit/edgeone-edgetunnel)
+> 记录的现象一致（它对 13 轮实测的结论也是"桥接未修复，等待平台"）。
+>
+> 验证方式与结果：
+> ```
+> 我的主项目 /          → 101 ✅，随后立即 1006 关闭
+> 我的 /echo（纯回显）   → 101 ✅，随后立即 1006 关闭
+> 官方模板（官方账号）   → 101 ✅，随后立即 1006 关闭
+> ```
+> 因此本项目当前**可用于握手验证与协议调试，但尚无法承载实际隧道流量**。
+> 平台修复数据中继后，本项目代码无需改动即可工作。
 
 1. **连接时长受限**。单次执行上限 120 秒（已配置）；站点层 WebSocket 空闲超时最长 300 秒。
    建议客户端心跳间隔设在 60 秒以内。客户端会自动重连。
