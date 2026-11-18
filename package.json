@@ -2,7 +2,7 @@
   "name": "vnts2-edgeone",
   "version": "1.0.0",
   "private": true,
-  "description": "VNT 2.x 服务端（vnts2）的 EdgeOne Cloud Functions 实现：WebSocket 中继 + P2P 打洞信令",
+  "description": "VNT 2.x 服务端（vnts2）的 EdgeOne Node Functions 实现：WebSocket 中继 + P2P 打洞信令（当前等待平台修复 WS 数据面）",
   "type": "module",
   "engines": {
     "node": ">=20"
